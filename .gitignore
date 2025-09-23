@@ -1,3 +1,7 @@
 scripts/
 .env
 next
+.DS_Store
+*.log
+*.tmp
+*.temp
