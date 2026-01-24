@@ -1,0 +1,10 @@
+github.com/aidarkhanov/nanoid/v2 v2.0.5 h1:HLx5RyDuvOZ6YxlhYTxSU8Il+q7xVKmXM62MfSxziN0=
+github.com/aidarkhanov/nanoid/v2 v2.0.5/go.mod h1:YF/U48D1yA3AoGGUdRrCV95J/KJBShvR9TyLqQwdtlI=
+github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
+github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+github.com/oklog/ulid/v2 v2.1.1 h1:suPZ4ARWLOJLegGFiZZ1dFAkqzhMjL3J1TzI+5wHz8s=
+github.com/oklog/ulid/v2 v2.1.1/go.mod h1:rcEKHmBBKfef9DhnvX7y1HZBYxjXb0cP5ExxNsTT1QQ=
+github.com/stateforward/hsm-go/kind v0.0.0-20260124060507-9cca10687b7c h1:nVPbItXu7deGLf8TZmWetCbIu8xBysXgb2s/RiMFJSM=
+github.com/stateforward/hsm-go/kind v0.0.0-20260124060507-9cca10687b7c/go.mod h1:uQwbHqVs7NpjSrVYJyaa8cC7vKjq4yIXdudh1ufcfqc=
+github.com/stateforward/hsm-go/muid v0.0.0-20260124060507-9cca10687b7c h1:i3ozKYwJO7R2kJ/2aeiRsTKlovs6XijOEGGoseOFuJk=
+github.com/stateforward/hsm-go/muid v0.0.0-20260124060507-9cca10687b7c/go.mod h1:r7xzw3A1+vWh0VMAggV2rXi+wB7y7pe8xxEXTrCIGZY=
