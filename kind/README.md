@@ -14,7 +14,7 @@ A high-performance hierarchical type system for Go using bit manipulation and ui
 ## Installation
 
 ```bash
-go get github.com/agentflare-ai/go-kind@main
+go get github.com/stateforward/hsm-go/kind@main
 ```
 
 ## Quick Start
@@ -24,7 +24,7 @@ package main
 
 import (
     "fmt"
-    "github.com/agentflare-ai/go-kind"
+    "github.com/stateforward/hsm-go/kind"
 )
 
 func main() {
