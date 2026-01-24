@@ -232,3 +232,11 @@ func Make() MUID {
 	idx := shards.idx.Add(1) % shards.size
 	return shards.pool[idx].ID()
 }
+
+// MakeString generates a new MUID using the default sharded generators
+// and returns it as a base32-encoded string.
+// This is a convenience function that combines Make() and String() calls.
+// The returned string is zero-padded to 13 characters and uses base32 encoding.
+func MakeString() string {
+	return Make().String()
+}

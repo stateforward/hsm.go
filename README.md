@@ -1,11 +1,11 @@
-# hsm [![PkgGoDev](https://pkg.go.dev/badge/github.com/runpod/hsm)](https://pkg.go.dev/github.com/runpod/hsm)
+# hsm [![PkgGoDev](https://pkg.go.dev/badge/github.com/agentflare-ai/hsm)](https://pkg.go.dev/github.com/agentflare-ai/hsm)
 
 Package go-hsm provides a powerful hierarchical state machine (HSM) implementation for Go. State machines help manage complex application states and transitions in a clear, maintainable way.
 
 ## Installation
 
 ```bash
-go get github.com/runpod/hsm/v2
+go get github.com/agentflare-ai/hsm
 ```
 
 ## Key Features
@@ -72,7 +72,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/runpod/hsm/v2"
+	"github.com/agentflare-ai/hsm"
 )
 
 // Define your state machine type
