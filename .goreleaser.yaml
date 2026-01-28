@@ -10,7 +10,7 @@ builds:
   - skip: true
 
 gomod:
-  proxy: true
+  proxy: false
 
 checksum:
   name_template: 'checksums.txt'
