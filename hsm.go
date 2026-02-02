@@ -56,8 +56,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/stateforward/hsm.go/kind"
-	"github.com/stateforward/hsm.go/muid"
+	"github.com/stateforward/hsm-go/kind"
+	"github.com/stateforward/hsm-go/muid"
 )
 
 var (
