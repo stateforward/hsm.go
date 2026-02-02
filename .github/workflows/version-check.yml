@@ -9,119 +9,217 @@ on:
 
 jobs:
   check-version:
-    name: Checking Version
+    name: Check Module Versions
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          # Fetch all history for all tags and branches
           fetch-depth: 0
 
-      - name: Get base version
-        id: base_version
+      - name: Get changed files
+        id: changed
         run: |
-          BASE_VERSION="v0.0.0" # Default
-          TARGET_REF=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA=${{ github.event.pull_request.base.sha }}
+            HEAD_SHA=${{ github.event.pull_request.head.sha }}
+          else
+            BASE_SHA=$(git rev-parse HEAD^)
+            HEAD_SHA=$(git rev-parse HEAD)
+          fi
 
+          CHANGED_FILES=$(git diff --name-only $BASE_SHA $HEAD_SHA)
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          # Determine which modules have changes (excluding version.go files)
+          ROOT_CHANGED="false"
+          KIND_CHANGED="false"
+          MUID_CHANGED="false"
+
+          # Check for root module changes (files not in kind/ or muid/)
+          if echo "$CHANGED_FILES" | grep -v "^kind/" | grep -v "^muid/" | grep -v "^\.github/" | grep -q "\.go$"; then
+            ROOT_CHANGED="true"
+          fi
+
+          # Check for kind module changes
+          if echo "$CHANGED_FILES" | grep -q "^kind/.*\.go$"; then
+            KIND_CHANGED="true"
+          fi
+
+          # Check for muid module changes
+          if echo "$CHANGED_FILES" | grep -q "^muid/.*\.go$"; then
+            MUID_CHANGED="true"
+          fi
+
+          echo "root_changed=$ROOT_CHANGED" >> $GITHUB_OUTPUT
+          echo "kind_changed=$KIND_CHANGED" >> $GITHUB_OUTPUT
+          echo "muid_changed=$MUID_CHANGED" >> $GITHUB_OUTPUT
+
+      - name: Fetch base branch
+        run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             TARGET_REF="${{ github.base_ref }}"
-            echo "Event is pull_request. Target ref: $TARGET_REF"
-            git fetch origin $TARGET_REF --depth=1
-          elif [ "${{ github.event_name }}" = "push" ]; then
-            # Assuming 'main' is the primary base branch for push events
+          else
             TARGET_REF="main"
-            echo "Event is push. Assuming base ref: $TARGET_REF"
-            git fetch origin $TARGET_REF --depth=1
-          else
-             echo "Unknown event type: ${{ github.event_name }}"
-             exit 1
           fi
+          git fetch origin $TARGET_REF --depth=1
 
-          # Construct the full ref name
-          FULL_TARGET_REF="origin/$TARGET_REF"
-
-          # Check if file exists on the target ref
-          if ! git cat-file -e $FULL_TARGET_REF:version.go 2>/dev/null; then
-            echo "version.go does not exist on base branch $FULL_TARGET_REF"
-            # Keep default BASE_VERSION = v0.0.0
-          else
-            echo "Attempting to get version from $FULL_TARGET_REF:version.go"
-            GIT_SHOW_OUTPUT=$(git show $FULL_TARGET_REF:version.go 2>/dev/null)
-            # echo "Raw output from git show:"
-            # echo "$GIT_SHOW_OUTPUT"
-            
-            EXTRACTED_VERSION=$(echo "$GIT_SHOW_OUTPUT" | grep 'const Version = ' | cut -d'"' -f2 || echo "")
-            if [ -n "$EXTRACTED_VERSION" ]; then
-              BASE_VERSION="$EXTRACTED_VERSION"
-            else
-              echo "Could not extract version string from base branch file."
-              # Keep default BASE_VERSION = v0.0.0
-            fi
-          fi
-
-          echo "Final Base Version: $BASE_VERSION"
-          echo "base_version=$BASE_VERSION" >> $GITHUB_OUTPUT
-
-      - name: Get PR version
-        id: pr_version
+      - name: Check root module version
+        if: steps.changed.outputs.root_changed == 'true'
         run: |
-          if [ ! -f version.go ]; then
-             echo "version.go not found in PR branch checkout"
-             exit 1
+          TARGET_REF="origin/${{ github.event_name == 'pull_request' && github.base_ref || 'main' }}"
+
+          # Get base version
+          BASE_VERSION="v0.0.0"
+          if git cat-file -e $TARGET_REF:version.go 2>/dev/null; then
+            BASE_VERSION=$(git show $TARGET_REF:version.go | grep 'const Version = ' | cut -d'"' -f2 || echo "v0.0.0")
           fi
-          PR_VERSION=$(grep 'const Version = ' version.go | cut -d'"' -f2)
-          if [ -z "$PR_VERSION" ]; then
-            echo "Could not find version string in PR branch version.go"
+
+          # Get PR version
+          if [ ! -f version.go ]; then
+            echo "❌ version.go not found"
             exit 1
           fi
-          echo "Final PR Version: $PR_VERSION"
-          echo "pr_version=$PR_VERSION" >> $GITHUB_OUTPUT
+          PR_VERSION=$(grep 'const Version = ' version.go | cut -d'"' -f2)
 
-      - name: Check version update
+          echo "Root module: Base=$BASE_VERSION, PR=$PR_VERSION"
+
+          # Compare versions
+          source .github/scripts/version-compare.sh 2>/dev/null || {
+            # Inline version comparison if script doesn't exist
+            compare_versions() {
+              local a=${1#v}
+              local b=${2#v}
+              IFS='.' read -r a1 a2 a3 <<< "$a"
+              IFS='.' read -r b1 b2 b3 <<< "$b"
+              if [ "$a1" -gt "$b1" ]; then return 0; fi
+              if [ "$a1" -lt "$b1" ]; then return 1; fi
+              if [ "$a2" -gt "$b2" ]; then return 0; fi
+              if [ "$a2" -lt "$b2" ]; then return 1; fi
+              if [ "$a3" -gt "$b3" ]; then return 0; fi
+              return 1
+            }
+          }
+
+          if [ "$BASE_VERSION" = "$PR_VERSION" ]; then
+            echo "❌ Root module version must be updated in version.go"
+            echo "   Current: $BASE_VERSION"
+            exit 1
+          fi
+
+          compare_versions "$PR_VERSION" "$BASE_VERSION" || {
+            echo "❌ Root module version must be incremented"
+            echo "   Base: $BASE_VERSION -> PR: $PR_VERSION"
+            exit 1
+          }
+
+          echo "✅ Root module version check passed: $BASE_VERSION -> $PR_VERSION"
+
+      - name: Check kind module version
+        if: steps.changed.outputs.kind_changed == 'true'
         run: |
-          # Function to compare semantic versions
-          version_compare() {
-            # Remove 'v' prefix if present
+          TARGET_REF="origin/${{ github.event_name == 'pull_request' && github.base_ref || 'main' }}"
+
+          BASE_VERSION="v0.0.0"
+          if git cat-file -e $TARGET_REF:kind/version.go 2>/dev/null; then
+            BASE_VERSION=$(git show $TARGET_REF:kind/version.go | grep 'const Version = ' | cut -d'"' -f2 || echo "v0.0.0")
+          fi
+
+          if [ ! -f kind/version.go ]; then
+            echo "❌ kind/version.go not found"
+            exit 1
+          fi
+          PR_VERSION=$(grep 'const Version = ' kind/version.go | cut -d'"' -f2)
+
+          echo "Kind module: Base=$BASE_VERSION, PR=$PR_VERSION"
+
+          compare_versions() {
             local a=${1#v}
             local b=${2#v}
-            
-            # Split into major.minor.patch
-            local a1 a2 a3 b1 b2 b3
             IFS='.' read -r a1 a2 a3 <<< "$a"
             IFS='.' read -r b1 b2 b3 <<< "$b"
-            
-            # Compare major versions
             if [ "$a1" -gt "$b1" ]; then return 0; fi
             if [ "$a1" -lt "$b1" ]; then return 1; fi
-            
-            # Compare minor versions
             if [ "$a2" -gt "$b2" ]; then return 0; fi
             if [ "$a2" -lt "$b2" ]; then return 1; fi
-            
-            # Compare patch versions
             if [ "$a3" -gt "$b3" ]; then return 0; fi
-            if [ "$a3" -lt "$b3" ]; then return 1; fi
-            
             return 1
           }
 
-          BASE_VERSION="${{ steps.base_version.outputs.base_version }}"
-          PR_VERSION="${{ steps.pr_version.outputs.pr_version }}"
+          if [ "$BASE_VERSION" = "$PR_VERSION" ]; then
+            echo "❌ Kind module version must be updated in kind/version.go"
+            exit 1
+          fi
 
-          echo "Comparing Base: $BASE_VERSION with PR: $PR_VERSION"
+          compare_versions "$PR_VERSION" "$BASE_VERSION" || {
+            echo "❌ Kind module version must be incremented"
+            exit 1
+          }
+
+          echo "✅ Kind module version check passed: $BASE_VERSION -> $PR_VERSION"
+
+      - name: Check muid module version
+        if: steps.changed.outputs.muid_changed == 'true'
+        run: |
+          TARGET_REF="origin/${{ github.event_name == 'pull_request' && github.base_ref || 'main' }}"
+
+          BASE_VERSION="v0.0.0"
+          if git cat-file -e $TARGET_REF:muid/version.go 2>/dev/null; then
+            BASE_VERSION=$(git show $TARGET_REF:muid/version.go | grep 'const Version = ' | cut -d'"' -f2 || echo "v0.0.0")
+          fi
+
+          if [ ! -f muid/version.go ]; then
+            echo "❌ muid/version.go not found"
+            exit 1
+          fi
+          PR_VERSION=$(grep 'const Version = ' muid/version.go | cut -d'"' -f2)
+
+          echo "MUID module: Base=$BASE_VERSION, PR=$PR_VERSION"
+
+          compare_versions() {
+            local a=${1#v}
+            local b=${2#v}
+            IFS='.' read -r a1 a2 a3 <<< "$a"
+            IFS='.' read -r b1 b2 b3 <<< "$b"
+            if [ "$a1" -gt "$b1" ]; then return 0; fi
+            if [ "$a1" -lt "$b1" ]; then return 1; fi
+            if [ "$a2" -gt "$b2" ]; then return 0; fi
+            if [ "$a2" -lt "$b2" ]; then return 1; fi
+            if [ "$a3" -gt "$b3" ]; then return 0; fi
+            return 1
+          }
 
           if [ "$BASE_VERSION" = "$PR_VERSION" ]; then
-            echo "Version must be updated in version.go before creating a PR"
-            echo "Current version: $BASE_VERSION"
+            echo "❌ MUID module version must be updated in muid/version.go"
             exit 1
           fi
 
-          if ! version_compare "$PR_VERSION" "$BASE_VERSION"; then
-            echo "Version must be incremented in version.go"
-            echo "Base version: $BASE_VERSION"
-            echo "PR version: $PR_VERSION"
-            echo "The PR version must be higher than the base version"
+          compare_versions "$PR_VERSION" "$BASE_VERSION" || {
+            echo "❌ MUID module version must be incremented"
             exit 1
+          }
+
+          echo "✅ MUID module version check passed: $BASE_VERSION -> $PR_VERSION"
+
+      - name: Summary
+        run: |
+          echo "## Version Check Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.changed.outputs.root_changed }}" = "true" ]; then
+            echo "- 📦 Root module (hsm.go) - checked" >> $GITHUB_STEP_SUMMARY
           fi
 
-          echo "Version check passed!"
+          if [ "${{ steps.changed.outputs.kind_changed }}" = "true" ]; then
+            echo "- 📦 Kind module - checked" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ steps.changed.outputs.muid_changed }}" = "true" ]; then
+            echo "- 📦 MUID module - checked" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ steps.changed.outputs.root_changed }}" = "false" ] && \
+             [ "${{ steps.changed.outputs.kind_changed }}" = "false" ] && \
+             [ "${{ steps.changed.outputs.muid_changed }}" = "false" ]; then
+            echo "- ℹ️ No Go files changed in any module" >> $GITHUB_STEP_SUMMARY
+          fi

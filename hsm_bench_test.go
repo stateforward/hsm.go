@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stateforward/hsm-go"
+	"github.com/stateforward/hsm.go"
 )
 
 // Event definitions for benchmarks

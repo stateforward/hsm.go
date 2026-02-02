@@ -1,0 +1,226 @@
+name: Auto Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'version.go'
+      - 'kind/version.go'
+      - 'muid/version.go'
+
+permissions:
+  contents: write
+
+jobs:
+  detect-and-release:
+    name: Detect Changes and Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: changed
+        run: |
+          # Get the commit before the push
+          BEFORE_SHA=${{ github.event.before }}
+          AFTER_SHA=${{ github.sha }}
+
+          # If this is the first commit or before is zeros, compare with parent
+          if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            BEFORE_SHA=$(git rev-parse HEAD^)
+          fi
+
+          echo "Comparing $BEFORE_SHA to $AFTER_SHA"
+
+          # Check which version files changed
+          CHANGED_FILES=$(git diff --name-only $BEFORE_SHA $AFTER_SHA)
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          ROOT_CHANGED="false"
+          KIND_CHANGED="false"
+          MUID_CHANGED="false"
+
+          if echo "$CHANGED_FILES" | grep -q "^version.go$"; then
+            ROOT_CHANGED="true"
+          fi
+
+          if echo "$CHANGED_FILES" | grep -q "^kind/version.go$"; then
+            KIND_CHANGED="true"
+          fi
+
+          if echo "$CHANGED_FILES" | grep -q "^muid/version.go$"; then
+            MUID_CHANGED="true"
+          fi
+
+          echo "root_changed=$ROOT_CHANGED" >> $GITHUB_OUTPUT
+          echo "kind_changed=$KIND_CHANGED" >> $GITHUB_OUTPUT
+          echo "muid_changed=$MUID_CHANGED" >> $GITHUB_OUTPUT
+
+      - name: Get versions
+        id: versions
+        run: |
+          # Extract versions from version.go files
+          ROOT_VERSION=$(grep 'const Version = ' version.go | cut -d'"' -f2)
+          KIND_VERSION=$(grep 'const Version = ' kind/version.go | cut -d'"' -f2)
+          MUID_VERSION=$(grep 'const Version = ' muid/version.go | cut -d'"' -f2)
+
+          echo "Root version: $ROOT_VERSION"
+          echo "Kind version: $KIND_VERSION"
+          echo "Muid version: $MUID_VERSION"
+
+          echo "root_version=$ROOT_VERSION" >> $GITHUB_OUTPUT
+          echo "kind_version=$KIND_VERSION" >> $GITHUB_OUTPUT
+          echo "muid_version=$MUID_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check existing tags
+        id: check_tags
+        run: |
+          ROOT_TAG="${{ steps.versions.outputs.root_version }}"
+          KIND_TAG="kind/${{ steps.versions.outputs.kind_version }}"
+          MUID_TAG="muid/${{ steps.versions.outputs.muid_version }}"
+
+          ROOT_EXISTS="false"
+          KIND_EXISTS="false"
+          MUID_EXISTS="false"
+
+          if git rev-parse "$ROOT_TAG" >/dev/null 2>&1; then
+            ROOT_EXISTS="true"
+            echo "Tag $ROOT_TAG already exists"
+          fi
+
+          if git rev-parse "$KIND_TAG" >/dev/null 2>&1; then
+            KIND_EXISTS="true"
+            echo "Tag $KIND_TAG already exists"
+          fi
+
+          if git rev-parse "$MUID_TAG" >/dev/null 2>&1; then
+            MUID_EXISTS="true"
+            echo "Tag $MUID_TAG already exists"
+          fi
+
+          echo "root_exists=$ROOT_EXISTS" >> $GITHUB_OUTPUT
+          echo "kind_exists=$KIND_EXISTS" >> $GITHUB_OUTPUT
+          echo "muid_exists=$MUID_EXISTS" >> $GITHUB_OUTPUT
+
+      - name: Create kind tag
+        if: steps.changed.outputs.kind_changed == 'true' && steps.check_tags.outputs.kind_exists == 'false'
+        run: |
+          TAG="kind/${{ steps.versions.outputs.kind_version }}"
+          echo "Creating tag: $TAG"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+      - name: Create muid tag
+        if: steps.changed.outputs.muid_changed == 'true' && steps.check_tags.outputs.muid_exists == 'false'
+        run: |
+          TAG="muid/${{ steps.versions.outputs.muid_version }}"
+          echo "Creating tag: $TAG"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+      - name: Create root tag
+        if: steps.changed.outputs.root_changed == 'true' && steps.check_tags.outputs.root_exists == 'false'
+        run: |
+          TAG="${{ steps.versions.outputs.root_version }}"
+          echo "Creating tag: $TAG"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+      - name: Create kind release
+        if: steps.changed.outputs.kind_changed == 'true' && steps.check_tags.outputs.kind_exists == 'false'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: kind/${{ steps.versions.outputs.kind_version }}
+          name: kind ${{ steps.versions.outputs.kind_version }}
+          body: |
+            ## Kind Module Release
+
+            ```go
+            import "github.com/stateforward/hsm.go/kind"
+            ```
+
+            ```bash
+            go get github.com/stateforward/hsm.go/kind@${{ steps.versions.outputs.kind_version }}
+            ```
+          generate_release_notes: true
+
+      - name: Create muid release
+        if: steps.changed.outputs.muid_changed == 'true' && steps.check_tags.outputs.muid_exists == 'false'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: muid/${{ steps.versions.outputs.muid_version }}
+          name: muid ${{ steps.versions.outputs.muid_version }}
+          body: |
+            ## MUID Module Release
+
+            ```go
+            import "github.com/stateforward/hsm.go/muid"
+            ```
+
+            ```bash
+            go get github.com/stateforward/hsm.go/muid@${{ steps.versions.outputs.muid_version }}
+            ```
+          generate_release_notes: true
+
+      - name: Create root release
+        if: steps.changed.outputs.root_changed == 'true' && steps.check_tags.outputs.root_exists == 'false'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.versions.outputs.root_version }}
+          name: hsm.go ${{ steps.versions.outputs.root_version }}
+          body: |
+            ## HSM.go Release
+
+            ```go
+            import "github.com/stateforward/hsm.go"
+            ```
+
+            ```bash
+            go get github.com/stateforward/hsm.go@${{ steps.versions.outputs.root_version }}
+            ```
+          generate_release_notes: true
+
+      - name: Summary
+        run: |
+          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.changed.outputs.root_changed }}" = "true" ]; then
+            if [ "${{ steps.check_tags.outputs.root_exists }}" = "false" ]; then
+              echo "- ✅ Released **hsm.go** ${{ steps.versions.outputs.root_version }}" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- ⏭️ Skipped **hsm.go** ${{ steps.versions.outputs.root_version }} (tag exists)" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
+          if [ "${{ steps.changed.outputs.kind_changed }}" = "true" ]; then
+            if [ "${{ steps.check_tags.outputs.kind_exists }}" = "false" ]; then
+              echo "- ✅ Released **kind** ${{ steps.versions.outputs.kind_version }}" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- ⏭️ Skipped **kind** ${{ steps.versions.outputs.kind_version }} (tag exists)" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
+          if [ "${{ steps.changed.outputs.muid_changed }}" = "true" ]; then
+            if [ "${{ steps.check_tags.outputs.muid_exists }}" = "false" ]; then
+              echo "- ✅ Released **muid** ${{ steps.versions.outputs.muid_version }}" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- ⏭️ Skipped **muid** ${{ steps.versions.outputs.muid_version }} (tag exists)" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
+          if [ "${{ steps.changed.outputs.root_changed }}" = "false" ] && \
+             [ "${{ steps.changed.outputs.kind_changed }}" = "false" ] && \
+             [ "${{ steps.changed.outputs.muid_changed }}" = "false" ]; then
+            echo "- ℹ️ No version files changed" >> $GITHUB_STEP_SUMMARY
+          fi

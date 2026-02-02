@@ -1,4 +1,4 @@
-module github.com/stateforward/hsm-go/muid
+module github.com/stateforward/hsm.go/muid
 
 go 1.24.5
 

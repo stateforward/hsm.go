@@ -1,6 +1,6 @@
 # package hsm
 
-`import "github.com/stateforward/hsm-go"`
+`import "github.com/stateforward/hsm.go"`
 
 Package hsm provides a powerful hierarchical state machine (HSM) implementation for Go.
 

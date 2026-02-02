@@ -39,7 +39,7 @@ The simplest and recommended way to generate an ID is to use the `Make()` functi
 ```go
 import (
 	"fmt"
-	"github.com/stateforward/hsm-go/muid"
+	"github.com/stateforward/hsm.go/muid"
 )
 
 func main() {
@@ -58,7 +58,7 @@ For cases where you only need the string representation, use `MakeString()` for 
 ```go
 import (
 	"fmt"
-	"github.com/stateforward/hsm-go/muid"
+	"github.com/stateforward/hsm.go/muid"
 )
 
 func main() {
@@ -78,7 +78,7 @@ While `Make()` is generally preferred, you can create individual generator insta
 ```go
 import (
 	"fmt"
-	"github.com/stateforward/hsm-go/muid"
+	"github.com/stateforward/hsm.go/muid"
 	"time"
 )
 

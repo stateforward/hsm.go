@@ -11,7 +11,7 @@ import (
 	"github.com/aidarkhanov/nanoid/v2"
 	"github.com/google/uuid"
 	"github.com/oklog/ulid/v2"
-	"github.com/stateforward/hsm-go/muid"
+	"github.com/stateforward/hsm.go/muid"
 )
 
 // BenchmarkMUIDGeneration benchmarks the generation of MUIDs
