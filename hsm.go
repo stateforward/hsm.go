@@ -79,21 +79,25 @@ var (
 	EventKind           = kind.Make(ElementKind)
 	TimeEventKind       = kind.Make(EventKind)
 	CompletionEventKind = kind.Make(EventKind)
+	ChangeEventKind     = kind.Make(EventKind)
+	CallEventKind       = kind.Make(EventKind)
 	ErrorEventKind      = kind.Make(CompletionEventKind)
 	PseudostateKind     = kind.Make(VertexKind)
 	InitialKind         = kind.Make(PseudostateKind)
 	FinalStateKind      = kind.Make(StateKind)
 	ChoiceKind          = kind.Make(PseudostateKind)
+	ShallowHistoryKind  = kind.Make(PseudostateKind)
+	DeepHistoryKind     = kind.Make(PseudostateKind)
 	CustomKind          = kind.Make(ElementKind)
 )
 
 var (
-	ErrNilHSM       = errors.New("hsm is nil")
-	ErrInvalidState = errors.New("invalid state")
-	ErrMissingHSM   = errors.New("missing hsm in context")
+	ErrNilHSM           = errors.New("hsm is nil")
+	ErrInvalidState     = errors.New("invalid state")
+	ErrMissingHSM       = errors.New("missing hsm in context")
+	ErrMissingOperation = errors.New("missing operation")
+	ErrInvalidOperation = errors.New("invalid operation")
 )
-
-
 
 /******* Element *******/
 
@@ -155,9 +159,11 @@ type Element interface {
 // It contains the root state and maintains a namespace of all elements.
 type Model struct {
 	state
-	members  map[string]Element
-	events   map[string]*Event
-	elements []RedefinableElement
+	members    map[string]Element
+	events     map[string]*Event
+	attributes map[string]*attribute
+	operations map[string]*operationDef
+	elements   []RedefinableElement
 	// TransitionMap provides fast lookup of transitions by state and event name
 	TransitionMap map[string]map[string][]*transition // stateQualifiedName -> eventName -> transitions
 	// DeferredMap provides fast lookup of deferred events by state
@@ -264,6 +270,21 @@ type constraint[T Instance] struct {
 	expression Expression[T]
 }
 
+/******* Attribute & Operation *******/
+
+type attribute struct {
+	name         string
+	defaultValue any
+	hasDefault   bool
+}
+
+type operationDef struct {
+	name    string
+	fn      any
+	fnValue reflect.Value
+	fnType  reflect.Type
+}
+
 /******* Events *******/
 
 // Event represents a trigger that can cause state transitions in the state machine.
@@ -320,6 +341,32 @@ var (
 	}
 	InfiniteDuration = time.Duration(-1)
 )
+
+const (
+	attributeEventPrefix = "__attr__:"
+	callEventPrefix      = "__call__:"
+)
+
+func attributeEventName(name string) string {
+	return attributeEventPrefix + name
+}
+
+func callEventName(name string) string {
+	return callEventPrefix + name
+}
+
+// AttributeChange is the payload for attribute change events.
+type AttributeChange struct {
+	Name string
+	Old  any
+	New  any
+}
+
+// CallData is the payload for call events.
+type CallData struct {
+	Name string
+	Args []any
+}
 
 var closedChannel = func() chan struct{} {
 	done := make(chan struct{})
@@ -397,6 +444,8 @@ func Define(name string, redefinableElements ...RedefinableElement) Model {
 		},
 		elements:      redefinableElements,
 		events:        map[string]*Event{},
+		attributes:    map[string]*attribute{},
+		operations:    map[string]*operationDef{},
 		TransitionMap: map[string]map[string][]*transition{},
 		DeferredMap:   map[string]map[string]struct{}{},
 	}
@@ -962,6 +1011,71 @@ func Guard[T Instance](fn func(ctx context.Context, hsm T, event Event) bool) Re
 	}
 }
 
+// Attribute declares a model-level attribute with an optional default value.
+// Attributes can be observed via OnSet("name") transitions and updated at runtime
+// via Set / Instance.Set.
+func Attribute(name string, maybeDefault ...any) RedefinableElement {
+	traceback := traceback()
+	return func(model *Model, stack []Element) Element {
+		if name == "" {
+			traceback(fmt.Errorf("attribute name cannot be empty"))
+		}
+		if strings.Contains(name, "/") {
+			traceback(fmt.Errorf("attribute name cannot contain '/'"))
+		}
+		if model.attributes == nil {
+			model.attributes = map[string]*attribute{}
+		}
+		if _, exists := model.attributes[name]; exists {
+			traceback(fmt.Errorf("attribute \"%s\" already defined", name))
+		}
+		attr := &attribute{name: name}
+		if len(maybeDefault) > 0 {
+			attr.defaultValue = maybeDefault[0]
+			attr.hasDefault = true
+		}
+		model.attributes[name] = attr
+		return nil
+	}
+}
+
+// OperationDef declares a named callable for Call()/OnCall().
+// Supported callables include function values and method expressions.
+func OperationDef(name string, fn any) RedefinableElement {
+	traceback := traceback()
+	return func(model *Model, stack []Element) Element {
+		if name == "" {
+			traceback(fmt.Errorf("operation name cannot be empty"))
+		}
+		if strings.Contains(name, "/") {
+			traceback(fmt.Errorf("operation name cannot contain '/'"))
+		}
+		if model.operations == nil {
+			model.operations = map[string]*operationDef{}
+		}
+		if _, exists := model.operations[name]; exists {
+			traceback(fmt.Errorf("operation \"%s\" already defined", name))
+		}
+		fnValue := reflect.ValueOf(fn)
+		fnType := fnValue.Type()
+		if !fnValue.IsValid() || fnType.Kind() != reflect.Func {
+			traceback(fmt.Errorf("operation \"%s\" must be a function", name))
+		}
+		model.operations[name] = &operationDef{
+			name:    name,
+			fn:      fn,
+			fnValue: fnValue,
+			fnType:  fnType,
+		}
+		return nil
+	}
+}
+
+// Op is a shorthand for OperationDef.
+func Op(name string, fn any) RedefinableElement {
+	return OperationDef(name, fn)
+}
+
 // Initial defines the initial state for a composite state or the entire state machine.
 // When a composite state is entered, its initial state is automatically entered.
 //
@@ -1068,6 +1182,68 @@ func Choice[T interface{ RedefinableElement | string }](elementOrName T, partial
 				traceback(fmt.Errorf("the last transition of choice state \"%s\" cannot have a guard", qualifiedName))
 			}
 		}
+		return element
+	}
+}
+
+// ShallowHistory creates a shallow history pseudostate within a composite state.
+// If no history is available, any transitions defined on this pseudostate are used;
+// otherwise the parent state's initial is used.
+func ShallowHistory[T interface{ RedefinableElement | string }](elementOrName T, partialElements ...RedefinableElement) RedefinableElement {
+	name := ""
+	switch any(elementOrName).(type) {
+	case string:
+		name = any(elementOrName).(string)
+	case RedefinableElement:
+		partialElements = append([]RedefinableElement{any(elementOrName).(RedefinableElement)}, partialElements...)
+	}
+	traceback := traceback()
+	return func(model *Model, stack []Element) Element {
+		owner := find(stack, StateKind)
+		if owner == nil {
+			traceback(fmt.Errorf("you must call ShallowHistory() within a State"))
+		}
+		if name == "" {
+			name = fmt.Sprintf("shallow_history_%d", len(model.elements))
+		}
+		qualifiedName := path.Join(owner.QualifiedName(), name)
+		element := &vertex{
+			element: element{kind: ShallowHistoryKind, qualifiedName: qualifiedName},
+		}
+		model.members[qualifiedName] = element
+		stack = append(stack, element)
+		apply(model, stack, partialElements...)
+		return element
+	}
+}
+
+// DeepHistory creates a deep history pseudostate within a composite state.
+// If no history is available, any transitions defined on this pseudostate are used;
+// otherwise the parent state's initial is used.
+func DeepHistory[T interface{ RedefinableElement | string }](elementOrName T, partialElements ...RedefinableElement) RedefinableElement {
+	name := ""
+	switch any(elementOrName).(type) {
+	case string:
+		name = any(elementOrName).(string)
+	case RedefinableElement:
+		partialElements = append([]RedefinableElement{any(elementOrName).(RedefinableElement)}, partialElements...)
+	}
+	traceback := traceback()
+	return func(model *Model, stack []Element) Element {
+		owner := find(stack, StateKind)
+		if owner == nil {
+			traceback(fmt.Errorf("you must call DeepHistory() within a State"))
+		}
+		if name == "" {
+			name = fmt.Sprintf("deep_history_%d", len(model.elements))
+		}
+		qualifiedName := path.Join(owner.QualifiedName(), name)
+		element := &vertex{
+			element: element{kind: DeepHistoryKind, qualifiedName: qualifiedName},
+		}
+		model.members[qualifiedName] = element
+		stack = append(stack, element)
+		apply(model, stack, partialElements...)
 		return element
 	}
 }
@@ -1195,6 +1371,71 @@ func On[T interface{ *Event | Event }](events ...T) RedefinableElement {
 			transition.events = append(transition.events, name)
 			model.events[name] = event
 		}
+		return owner
+	}
+}
+
+// OnSet creates an attribute-change trigger for the given attribute name.
+// It is the attribute-based equivalent of On(...) and is driven by Set.
+func OnSet(name string) RedefinableElement {
+	traceback := traceback()
+	return func(model *Model, stack []Element) Element {
+		owner := find(stack, TransitionKind)
+		if owner == nil {
+			traceback(fmt.Errorf("OnSet() must be called within a Transition"))
+		}
+		if name == "" {
+			traceback(fmt.Errorf("OnSet() requires a non-empty attribute name"))
+		}
+		if strings.Contains(name, "/") {
+			traceback(fmt.Errorf("attribute name cannot contain '/'"))
+		}
+		transition := owner.(*transition)
+		eventName := attributeEventName(name)
+		transition.events = append(transition.events, eventName)
+		model.events[eventName] = &Event{
+			Kind:   ChangeEventKind,
+			Name:   eventName,
+			Source: name,
+		}
+		if model.attributes == nil {
+			model.attributes = map[string]*attribute{}
+		}
+		if _, exists := model.attributes[name]; !exists {
+			model.attributes[name] = &attribute{name: name}
+		}
+		return owner
+	}
+}
+
+// OnCall creates a trigger for Call() invocations of the named operation.
+func OnCall(name string) RedefinableElement {
+	traceback := traceback()
+	return func(model *Model, stack []Element) Element {
+		owner := find(stack, TransitionKind)
+		if owner == nil {
+			traceback(fmt.Errorf("OnCall() must be called within a Transition"))
+		}
+		if name == "" {
+			traceback(fmt.Errorf("OnCall() requires a non-empty operation name"))
+		}
+		if strings.Contains(name, "/") {
+			traceback(fmt.Errorf("operation name cannot contain '/'"))
+		}
+		transition := owner.(*transition)
+		eventName := callEventName(name)
+		transition.events = append(transition.events, eventName)
+		model.events[eventName] = &Event{
+			Kind:   CallEventKind,
+			Name:   eventName,
+			Source: name,
+		}
+		model.push(func(model *Model, stack []Element) Element {
+			if model.operations == nil || model.operations[name] == nil {
+				traceback(fmt.Errorf("missing operation \"%s\" for OnCall()", name))
+			}
+			return owner
+		})
 		return owner
 	}
 }
@@ -1557,6 +1798,17 @@ type mutex struct {
 	signal   atomic.Value
 }
 
+type processKey struct{}
+
+func inProcess(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	value := ctx.Value(processKey{})
+	ok, _ := value.(bool)
+	return ok
+}
+
 func (mutex *mutex) wLock() {
 	mutex.internal.Lock()
 	mutex.signal.Store(make(chan struct{}))
@@ -1595,6 +1847,9 @@ type Instance interface {
 	// State returns the current state's qualified name.
 	State() string
 	Context() context.Context
+	Get(name string) (any, bool)
+	Set(ctx context.Context, name string, value any) <-chan struct{}
+	Call(ctx context.Context, name string, args ...any) (any, error)
 	// non exported
 	channels() *after
 	takeSnapshot() Snapshot
@@ -1608,16 +1863,20 @@ type Instance interface {
 
 type hsm[T Instance] struct {
 	behavior[T]
-	state      atomic.Value
-	context    context.Context
-	cancel     context.CancelFunc
-	model      *Model
-	active     map[string]*active
-	queue      queue
-	instance   T
-	timeouts   timeouts
-	processing mutex
-	after      after
+	state          atomic.Value
+	context        context.Context
+	cancel         context.CancelFunc
+	model          *Model
+	active         map[string]*active
+	queue          queue
+	attributes     map[string]any
+	attrMutex      sync.RWMutex
+	historyShallow map[string]string
+	historyDeep    map[string]string
+	instance       T
+	timeouts       timeouts
+	processing     mutex
+	after          after
 }
 
 // Config provides configuration options for state machine initialization.
@@ -1682,12 +1941,15 @@ func New[T Instance](sm T, model *Model, maybeConfig ...Config) T {
 				kind: StateMachineKind,
 			},
 		},
-		context:  context.Background(),
-		cancel:   func() {},
-		model:    model,
-		instance: sm,
-		queue:    queue{},
-		active:   map[string]*active{},
+		context:        context.Background(),
+		cancel:         func() {},
+		model:          model,
+		instance:       sm,
+		queue:          queue{},
+		active:         map[string]*active{},
+		attributes:     map[string]any{},
+		historyShallow: map[string]string{},
+		historyDeep:    map[string]string{},
 	}
 	hsm.state.Store(&model.state)
 	if len(maybeConfig) > 0 {
@@ -1704,6 +1966,11 @@ func New[T Instance](sm T, model *Model, maybeConfig ...Config) T {
 	}
 	if hsm.timeouts.activity == 0 {
 		hsm.timeouts.activity = time.Millisecond
+	}
+	for name, attr := range model.attributes {
+		if attr != nil && attr.hasDefault {
+			hsm.attributes[name] = attr.defaultValue
+		}
 	}
 	hsm.behavior.operation = func(ctx context.Context, _ T, event Event) {
 		hsm.state.Store(hsm.enter(ctx, &hsm.model.state, &event, true))
@@ -1786,6 +2053,8 @@ func (sm *hsm[T]) stop(ctx context.Context) <-chan struct{} {
 		}
 		sm.cancel()
 		clear(sm.active)
+		clear(sm.historyShallow)
+		clear(sm.historyDeep)
 		if instances, ok := sm.context.Value(Keys.Instances).(*sync.Map); ok {
 			instances.Delete(sm.behavior.id)
 		}
@@ -1800,6 +2069,225 @@ func (sm *hsm[T]) Context() context.Context {
 		return nil
 	}
 	return sm.context
+}
+
+func (sm *hsm[T]) Get(name string) (any, bool) {
+	if sm == nil {
+		return nil, false
+	}
+	sm.attrMutex.RLock()
+	defer sm.attrMutex.RUnlock()
+	value, ok := sm.attributes[name]
+	return value, ok
+}
+
+func (sm *hsm[T]) Set(ctx context.Context, name string, value any) <-chan struct{} {
+	return sm.setAttribute(ctx, name, value, true)
+}
+
+func (sm *hsm[T]) setAttribute(ctx context.Context, name string, value any, emit bool) <-chan struct{} {
+	if sm == nil {
+		return closedChannel
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sm.attrMutex.Lock()
+	old, exists := sm.attributes[name]
+	sm.attributes[name] = value
+	sm.attrMutex.Unlock()
+	if !emit {
+		return closedChannel
+	}
+	if exists && reflect.DeepEqual(old, value) {
+		return closedChannel
+	}
+	event := Event{
+		Kind:   ChangeEventKind,
+		Name:   attributeEventName(name),
+		Source: name,
+		Data: AttributeChange{
+			Name: name,
+			Old:  old,
+			New:  value,
+		},
+	}
+	return sm.dispatch(ctx, event)
+}
+
+func (sm *hsm[T]) Call(ctx context.Context, name string, args ...any) (any, error) {
+	if sm == nil {
+		return nil, ErrNilHSM
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if name == "" {
+		return nil, ErrInvalidOperation
+	}
+	op := sm.model.operations[name]
+	if op == nil {
+		return nil, ErrMissingOperation
+	}
+	event := Event{
+		Kind:   CallEventKind,
+		Name:   callEventName(name),
+		Source: name,
+		Data: CallData{
+			Name: name,
+			Args: args,
+		},
+	}
+	if inProcess(ctx) {
+		if event.ID == "" {
+			event.ID = muid.MakeString()
+		}
+		transitionTaken, deferred := sm.processEvent(ctx, &event)
+		if deferred {
+			sm.queue.push(event)
+		}
+		if transitionTaken {
+			// No-op: state already updated by processEvent.
+		}
+	} else {
+		<-sm.dispatch(ctx, event)
+	}
+	return sm.invokeOperation(op, ctx, args...)
+}
+
+func (sm *hsm[T]) invokeOperation(op *operationDef, ctx context.Context, args ...any) (any, error) {
+	if op == nil {
+		return nil, ErrMissingOperation
+	}
+	fnType := op.fnType
+	fnValue := op.fnValue
+	if !fnValue.IsValid() || fnType.Kind() != reflect.Func {
+		return nil, ErrInvalidOperation
+	}
+	instanceValue := reflect.ValueOf(sm.instance)
+	ctxValue := reflect.ValueOf(ctx)
+	type candidate struct {
+		useCtx      bool
+		useInstance bool
+	}
+	candidates := []candidate{
+		{useCtx: true, useInstance: true},
+		{useCtx: true, useInstance: false},
+		{useCtx: false, useInstance: true},
+		{useCtx: false, useInstance: false},
+	}
+
+	var callArgs []reflect.Value
+	matched := false
+	for _, c := range candidates {
+		callArgs = callArgs[:0]
+		argIndex := 0
+		if c.useCtx {
+			if argIndex >= fnType.NumIn() {
+				continue
+			}
+			paramType := fnType.In(argIndex)
+			if !ctxValue.Type().AssignableTo(paramType) && !ctxValue.Type().ConvertibleTo(paramType) {
+				continue
+			}
+			if ctxValue.Type().AssignableTo(paramType) {
+				callArgs = append(callArgs, ctxValue)
+			} else {
+				callArgs = append(callArgs, ctxValue.Convert(paramType))
+			}
+			argIndex++
+		}
+		if c.useInstance {
+			if argIndex >= fnType.NumIn() {
+				continue
+			}
+			paramType := fnType.In(argIndex)
+			switch {
+			case instanceValue.Type().AssignableTo(paramType):
+				callArgs = append(callArgs, instanceValue)
+			case instanceValue.Type().ConvertibleTo(paramType):
+				callArgs = append(callArgs, instanceValue.Convert(paramType))
+			case instanceValue.Kind() == reflect.Pointer && instanceValue.Elem().IsValid() && instanceValue.Elem().Type().AssignableTo(paramType):
+				callArgs = append(callArgs, instanceValue.Elem())
+			case instanceValue.Kind() == reflect.Pointer && instanceValue.Elem().IsValid() && instanceValue.Elem().Type().ConvertibleTo(paramType):
+				callArgs = append(callArgs, instanceValue.Elem().Convert(paramType))
+			default:
+				continue
+			}
+			argIndex++
+		}
+		remainingParams := fnType.NumIn() - argIndex
+		if !fnType.IsVariadic() {
+			if remainingParams != len(args) {
+				continue
+			}
+		} else {
+			if len(args) < remainingParams-1 {
+				continue
+			}
+		}
+		validArgs := true
+		for i := 0; i < len(args); i++ {
+			paramIndex := argIndex + i
+			var paramType reflect.Type
+			if fnType.IsVariadic() && paramIndex >= fnType.NumIn()-1 {
+				paramType = fnType.In(fnType.NumIn() - 1).Elem()
+			} else if paramIndex < fnType.NumIn() {
+				paramType = fnType.In(paramIndex)
+			} else {
+				validArgs = false
+				break
+			}
+			value := reflect.ValueOf(args[i])
+			if !value.IsValid() {
+				if paramType.Kind() == reflect.Interface || paramType.Kind() == reflect.Pointer || paramType.Kind() == reflect.Slice || paramType.Kind() == reflect.Map || paramType.Kind() == reflect.Func || paramType.Kind() == reflect.Chan {
+					callArgs = append(callArgs, reflect.Zero(paramType))
+					continue
+				}
+				validArgs = false
+				break
+			}
+			if value.Type().AssignableTo(paramType) {
+				callArgs = append(callArgs, value)
+				continue
+			}
+			if value.Type().ConvertibleTo(paramType) {
+				callArgs = append(callArgs, value.Convert(paramType))
+				continue
+			}
+			validArgs = false
+			break
+		}
+		if !validArgs {
+			continue
+		}
+		matched = true
+		break
+	}
+
+	if !matched {
+		return nil, ErrInvalidOperation
+	}
+
+	results := fnValue.Call(callArgs)
+	switch len(results) {
+	case 0:
+		return nil, nil
+	case 1:
+		if err, ok := results[0].Interface().(error); ok {
+			return nil, err
+		}
+		return results[0].Interface(), nil
+	default:
+		last := results[len(results)-1].Interface()
+		if err, ok := last.(error); ok {
+			if len(results) == 2 {
+				return results[0].Interface(), err
+			}
+			return results[:len(results)-1], err
+		}
+		return results[0].Interface(), nil
+	}
 }
 
 func (sm *hsm[T]) channels() *after {
@@ -1840,6 +2328,7 @@ func (sm *hsm[T]) enter(ctx context.Context, element Element, event *Event, defa
 	switch element.Kind() {
 	case StateKind:
 		state := element.(*state)
+		sm.recordHistory(state.QualifiedName())
 		for _, entry := range state.entry {
 			if entry := get[*behavior[T]](sm.model, entry); entry != nil {
 				sm.execute(ctx, entry, event)
@@ -1860,8 +2349,8 @@ func (sm *hsm[T]) enter(ctx context.Context, element Element, event *Event, defa
 		}
 		return state
 	case ChoiceKind:
-		vertex := element.(*vertex)
-		for _, qualifiedName := range vertex.transitions {
+		choiceVertex := element.(*vertex)
+		for _, qualifiedName := range choiceVertex.transitions {
 			if transition := get[*transition](sm.model, qualifiedName); transition != nil {
 				if constraint := get[*constraint[T]](sm.model, transition.Guard()); constraint != nil {
 					if !sm.evaluate(ctx, constraint, event) {
@@ -1871,6 +2360,47 @@ func (sm *hsm[T]) enter(ctx context.Context, element Element, event *Event, defa
 				return sm.transition(ctx, element, transition, event)
 			}
 		}
+	case ShallowHistoryKind, DeepHistoryKind:
+		historyVertex := element.(*vertex)
+		parent := element.Owner()
+		if parent == "" {
+			return element
+		}
+		resolved := sm.resolveHistory(parent, element.Kind())
+		if resolved != "" && !IsAncestor(parent, resolved) {
+			resolved = ""
+		}
+		if resolved == "" {
+			if next := sm.followHistoryDefault(ctx, historyVertex, event); next != nil {
+				return next
+			}
+			if parentState := get[*state](sm.model, parent); parentState != nil && parentState.initial != "" {
+				if initialVertex := get[*vertex](sm.model, parentState.initial); initialVertex != nil {
+					if len(initialVertex.transitions) > 0 {
+						if transition := get[*transition](sm.model, initialVertex.transitions[0]); transition != nil {
+							return sm.transition(ctx, parentState, transition, event)
+						}
+					}
+				}
+			}
+			return element
+		}
+		enterPath := buildEnterPath(parent, resolved)
+		for i, entering := range enterPath {
+			next, ok := sm.model.members[entering]
+			if !ok {
+				return nil
+			}
+			defaultEntry := false
+			if element.Kind() == ShallowHistoryKind && i == len(enterPath)-1 {
+				defaultEntry = true
+			}
+			current := sm.enter(ctx, next, event, defaultEntry)
+			if i == len(enterPath)-1 {
+				return current
+			}
+		}
+		return element
 	case FinalStateKind:
 		if element.Owner() == sm.model.qualifiedName {
 			sm.cancel()
@@ -1900,6 +2430,80 @@ func (sm *hsm[T]) exit(ctx context.Context, element Element, event *Event) {
 		}
 	}
 
+}
+
+func (sm *hsm[T]) recordHistory(stateName string) {
+	if sm == nil || stateName == "" {
+		return
+	}
+	child := stateName
+	parent := path.Dir(child)
+	for parent != "" && parent != "." {
+		if parent == "/" {
+			break
+		}
+		if element := sm.model.members[parent]; element != nil && kind.Is(element.Kind(), StateKind) {
+			sm.historyDeep[parent] = stateName
+			sm.historyShallow[parent] = child
+		}
+		if parent == sm.model.qualifiedName {
+			break
+		}
+		next := path.Dir(parent)
+		if next == parent {
+			break
+		}
+		child = parent
+		parent = next
+	}
+}
+
+func (sm *hsm[T]) resolveHistory(parent string, historyKind uint64) string {
+	switch historyKind {
+	case ShallowHistoryKind:
+		return sm.historyShallow[parent]
+	case DeepHistoryKind:
+		return sm.historyDeep[parent]
+	default:
+		return ""
+	}
+}
+
+func (sm *hsm[T]) followHistoryDefault(ctx context.Context, historyVertex *vertex, event *Event) Element {
+	if historyVertex == nil {
+		return nil
+	}
+	for _, qualifiedName := range historyVertex.transitions {
+		if transition := get[*transition](sm.model, qualifiedName); transition != nil {
+			if constraint := get[*constraint[T]](sm.model, transition.Guard()); constraint != nil {
+				if !sm.evaluate(ctx, constraint, event) {
+					continue
+				}
+			}
+			return sm.transition(ctx, historyVertex, transition, event)
+		}
+	}
+	return nil
+}
+
+func buildEnterPath(parent, target string) []string {
+	if parent == "" || target == "" {
+		return nil
+	}
+	if parent == target {
+		return nil
+	}
+	enter := []string{}
+	current := target
+	for current != "" && current != parent {
+		enter = append([]string{current}, enter...)
+		next := path.Dir(current)
+		if next == current {
+			break
+		}
+		current = next
+	}
+	return enter
 }
 
 func cleanup[T Instance](ctx context.Context, sm *hsm[T], element Element) {
@@ -2007,6 +2611,7 @@ func (sm *hsm[T]) terminate(ctx context.Context, element Element) {
 }
 
 func (sm *hsm[T]) process(ctx context.Context) {
+	ctx = context.WithValue(ctx, processKey{}, true)
 	defer func() {
 		if r := recover(); r != nil {
 			err := fmt.Errorf("hsm: panic while processing event in state machine: %v\n\n%s", r, string(debug.Stack()))
@@ -2021,71 +2626,82 @@ func (sm *hsm[T]) process(ctx context.Context) {
 	var deferred []Event
 	event, ok := sm.queue.pop()
 	for ok {
-		if event.ID == "" {
-			event.ID = muid.MakeString()
+		transitionTaken, isDeferred := sm.processEvent(ctx, &event)
+		if isDeferred {
+			deferred = append(deferred, event)
+			event, _ = sm.queue.pop()
+			continue
 		}
-		currentState := sm.state.Load().(Element)
-		currentQualifiedName := currentState.QualifiedName()
+		if transitionTaken && len(deferred) > 0 {
+			sm.queue.push(deferred...)
+			deferred = nil
+		}
+		event, ok = sm.queue.pop()
+	}
+	sm.queue.push(deferred...)
+}
 
-		// Check if event is deferred using O(1) lookup
-		if deferredSet, ok := sm.model.DeferredMap[currentQualifiedName]; ok {
-			if _, isDeferred := deferredSet[event.Name]; isDeferred {
-				deferred = append(deferred, event)
-				event, _ = sm.queue.pop()
-				continue
-			}
+func (sm *hsm[T]) processEvent(ctx context.Context, event *Event) (transitionTaken bool, deferred bool) {
+	if sm == nil || event == nil {
+		return false, false
+	}
+	if event.Kind == 0 {
+		event.Kind = EventKind
+	}
+	if event.ID == "" {
+		event.ID = muid.MakeString()
+	}
+	currentState := sm.state.Load().(Element)
+	currentQualifiedName := currentState.QualifiedName()
+
+	// Check if event is deferred using O(1) lookup
+	if deferredSet, ok := sm.model.DeferredMap[currentQualifiedName]; ok {
+		if _, isDeferred := deferredSet[event.Name]; isDeferred {
+			return false, true
 		}
-		// Direct O(1) lookup for transitions - no hierarchy walking needed
-		transitionTaken := false
-		if transitions, ok := sm.model.TransitionMap[currentQualifiedName][event.Name]; ok {
-			for _, transition := range transitions {
+	}
+
+	// Direct O(1) lookup for transitions - no hierarchy walking needed
+	if transitions, ok := sm.model.TransitionMap[currentQualifiedName][event.Name]; ok {
+		for _, transition := range transitions {
+			if guard := get[*constraint[T]](sm.model, transition.Guard()); guard != nil {
+				if !sm.evaluate(ctx, guard, event) {
+					continue
+				}
+			}
+			state := sm.transition(ctx, currentState, transition, event)
+			if state != nil {
+				sm.state.Store(state)
+				transitionTaken = true
+			}
+			break
+		}
+	}
+
+	// If no specific transition was taken, check for AnyEvent transitions
+	// AnyEvent transitions are only taken when no explicit event match with passing guard exists
+	if !transitionTaken && event.Name != AnyEvent.Name {
+		if anyTransitions, ok := sm.model.TransitionMap[currentQualifiedName][AnyEvent.Name]; ok {
+			for _, transition := range anyTransitions {
 				if guard := get[*constraint[T]](sm.model, transition.Guard()); guard != nil {
-					if !sm.evaluate(ctx, guard, &event) {
+					if !sm.evaluate(ctx, guard, event) {
 						continue
 					}
 				}
-				state := sm.transition(ctx, currentState, transition, &event)
+				state := sm.transition(ctx, currentState, transition, event)
 				if state != nil {
 					sm.state.Store(state)
-					if len(deferred) > 0 {
-						sm.queue.push(deferred...)
-						deferred = nil
-					}
 					transitionTaken = true
 				}
 				break
 			}
 		}
-
-		// If no specific transition was taken, check for AnyEvent transitions
-		// AnyEvent transitions are only taken when no explicit event match with passing guard exists
-		if !transitionTaken && event.Name != AnyEvent.Name {
-			if anyTransitions, ok := sm.model.TransitionMap[currentQualifiedName][AnyEvent.Name]; ok {
-				for _, transition := range anyTransitions {
-					if guard := get[*constraint[T]](sm.model, transition.Guard()); guard != nil {
-						if !sm.evaluate(ctx, guard, &event) {
-							continue
-						}
-					}
-					state := sm.transition(ctx, currentState, transition, &event)
-					if state != nil {
-						sm.state.Store(state)
-						if len(deferred) > 0 {
-							sm.queue.push(deferred...)
-							deferred = nil
-						}
-					}
-					break
-				}
-			}
-		}
-
-		if ch, ok := sm.after.processed.LoadAndDelete(event.Name); ok {
-			close(ch.(chan struct{}))
-		}
-		event, ok = sm.queue.pop()
 	}
-	sm.queue.push(deferred...)
+
+	if ch, ok := sm.after.processed.LoadAndDelete(event.Name); ok {
+		close(ch.(chan struct{}))
+	}
+	return transitionTaken, false
 }
 
 func (sm *hsm[T]) takeSnapshot() Snapshot {
@@ -2173,6 +2789,39 @@ func Dispatch[T context.Context](ctx T, hsm Instance, event Event) <-chan struct
 		return hsm.dispatch(ctx, event)
 	}
 	return closedChannel
+}
+
+// Get reads an attribute value from the given state machine or from context.
+func Get(ctx context.Context, hsm Instance, name string) (any, bool) {
+	if hsm != nil {
+		return hsm.Get(name)
+	}
+	if hsm, ok := FromContext(ctx); ok {
+		return hsm.Get(name)
+	}
+	return nil, false
+}
+
+// Set updates an attribute value and emits an OnSet change event.
+func Set(ctx context.Context, hsm Instance, name string, value any) <-chan struct{} {
+	if hsm != nil {
+		return hsm.Set(ctx, name, value)
+	}
+	if hsm, ok := FromContext(ctx); ok {
+		return hsm.Set(ctx, name, value)
+	}
+	return closedChannel
+}
+
+// Call dispatches an OnCall event and invokes the named operation.
+func Call(ctx context.Context, hsm Instance, name string, args ...any) (any, error) {
+	if hsm != nil {
+		return hsm.Call(ctx, name, args...)
+	}
+	if hsm, ok := FromContext(ctx); ok {
+		return hsm.Call(ctx, name, args...)
+	}
+	return nil, ErrMissingHSM
 }
 
 // DispatchAll sends an event to all state machine instances in the current context.

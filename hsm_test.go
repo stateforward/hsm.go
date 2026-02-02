@@ -2,6 +2,8 @@ package hsm_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -57,6 +59,61 @@ type Event struct{}
 type THSM struct {
 	hsm.HSM
 	foo int
+}
+
+type AttrHSM struct {
+	hsm.HSM
+}
+
+type CallOrderHSM struct {
+	hsm.HSM
+	mu    sync.Mutex
+	order []string
+}
+
+func (sm *CallOrderHSM) record(step string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.order = append(sm.order, step)
+}
+
+func (sm *CallOrderHSM) orderSnapshot() []string {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	return append([]string(nil), sm.order...)
+}
+
+type CallSigHSM struct {
+	hsm.HSM
+	mu   sync.Mutex
+	hits []string
+}
+
+func (sm *CallSigHSM) record(hit string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.hits = append(sm.hits, hit)
+}
+
+func (sm *CallSigHSM) hitsSnapshot() []string {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	return append([]string(nil), sm.hits...)
+}
+
+func (sm *CallSigHSM) methodExpr(arg string) string {
+	sm.record("methodExpr")
+	return "method:" + arg
+}
+
+func assertPanic(t *testing.T, name string, fn func()) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("expected panic for %s", name)
+		}
+	}()
+	fn()
 }
 
 func TestComplex(t *testing.T) {
@@ -727,6 +784,496 @@ func TestInitialEventData(t *testing.T) {
 	if configData.Load().foo != "testing" {
 		t.Fatal("config data is not correct", "config data", configData.Load())
 	}
+}
+
+func TestAttributeDefaultAndOnSet(t *testing.T) {
+	changeCh := make(chan hsm.AttributeChange, 1)
+	kindCh := make(chan uint64, 1)
+	model := hsm.Define(
+		"AttrHSM",
+		hsm.Attribute("count", 1),
+		hsm.State("idle",
+			hsm.Transition(
+				hsm.OnSet("count"),
+				hsm.Target("../changed"),
+				hsm.Effect(func(ctx context.Context, sm *AttrHSM, event hsm.Event) {
+					if change, ok := event.Data.(hsm.AttributeChange); ok {
+						changeCh <- change
+					}
+					kindCh <- event.Kind
+				}),
+			),
+		),
+		hsm.State("changed"),
+		hsm.Initial(hsm.Target("idle")),
+	)
+	sm := hsm.Started(context.Background(), &AttrHSM{}, &model)
+	if value, ok := sm.Get("count"); !ok || value.(int) != 1 {
+		t.Fatal("expected default attribute value", "value", value, "ok", ok)
+	}
+	<-sm.Set(context.Background(), "count", 1)
+	if sm.State() != "/AttrHSM/idle" {
+		t.Fatal("state changed on identical attribute set", "state", sm.State())
+	}
+	select {
+	case <-changeCh:
+		t.Fatal("unexpected attribute change event for identical value")
+	default:
+	}
+	<-sm.Set(context.Background(), "count", 2)
+	if sm.State() != "/AttrHSM/changed" {
+		t.Fatal("state did not transition on attribute change", "state", sm.State())
+	}
+	var change hsm.AttributeChange
+	select {
+	case change = <-changeCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for attribute change event")
+	}
+	if change.Name != "count" {
+		t.Fatal("attribute change name mismatch", "name", change.Name)
+	}
+	oldValue, ok := change.Old.(int)
+	if !ok || oldValue != 1 {
+		t.Fatal("attribute change old value mismatch", "old", change.Old)
+	}
+	newValue, ok := change.New.(int)
+	if !ok || newValue != 2 {
+		t.Fatal("attribute change new value mismatch", "new", change.New)
+	}
+	var kind uint64
+	select {
+	case kind = <-kindCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for attribute change kind")
+	}
+	if kind != hsm.ChangeEventKind {
+		t.Fatal("attribute change kind mismatch", "kind", kind)
+	}
+}
+
+func TestOnSetImplicitAttribute(t *testing.T) {
+	changeCh := make(chan hsm.AttributeChange, 1)
+	model := hsm.Define(
+		"AttrImplicitHSM",
+		hsm.State("idle",
+			hsm.Transition(
+				hsm.OnSet("dynamic"),
+				hsm.Target("../changed"),
+				hsm.Effect(func(ctx context.Context, sm *AttrHSM, event hsm.Event) {
+					if change, ok := event.Data.(hsm.AttributeChange); ok {
+						changeCh <- change
+					}
+				}),
+			),
+		),
+		hsm.State("changed"),
+		hsm.Initial(hsm.Target("idle")),
+	)
+	sm := hsm.Started(context.Background(), &AttrHSM{}, &model)
+	if _, ok := sm.Get("dynamic"); ok {
+		t.Fatal("expected no default for implicit attribute")
+	}
+	<-sm.Set(context.Background(), "dynamic", 42)
+	if sm.State() != "/AttrImplicitHSM/changed" {
+		t.Fatal("state did not transition on implicit attribute change", "state", sm.State())
+	}
+	var change hsm.AttributeChange
+	select {
+	case change = <-changeCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for implicit attribute change")
+	}
+	if change.Name != "dynamic" {
+		t.Fatal("implicit attribute change name mismatch", "name", change.Name)
+	}
+	if change.Old != nil {
+		t.Fatal("implicit attribute old value should be nil", "old", change.Old)
+	}
+	newValue, ok := change.New.(int)
+	if !ok || newValue != 42 {
+		t.Fatal("implicit attribute new value mismatch", "new", change.New)
+	}
+}
+
+func TestAttributeValidation(t *testing.T) {
+	assertPanic(t, "empty attribute name", func() {
+		hsm.Define(
+			"BadAttrEmpty",
+			hsm.Attribute(""),
+			hsm.State("s"),
+			hsm.Initial(hsm.Target("s")),
+		)
+	})
+	assertPanic(t, "attribute name with slash", func() {
+		hsm.Define(
+			"BadAttrSlash",
+			hsm.Attribute("bad/name"),
+			hsm.State("s"),
+			hsm.Initial(hsm.Target("s")),
+		)
+	})
+	assertPanic(t, "duplicate attribute", func() {
+		hsm.Define(
+			"BadAttrDup",
+			hsm.Attribute("dup"),
+			hsm.Attribute("dup"),
+			hsm.State("s"),
+			hsm.Initial(hsm.Target("s")),
+		)
+	})
+	assertPanic(t, "OnSet outside Transition", func() {
+		hsm.Define(
+			"BadOnSetOwner",
+			hsm.State("s", hsm.OnSet("attr")),
+			hsm.Initial(hsm.Target("s")),
+		)
+	})
+	assertPanic(t, "OnSet empty name", func() {
+		hsm.Define(
+			"BadOnSetEmpty",
+			hsm.State("s", hsm.Transition(hsm.OnSet(""), hsm.Target("../t"))),
+			hsm.State("t"),
+			hsm.Initial(hsm.Target("s")),
+		)
+	})
+	assertPanic(t, "OnSet name with slash", func() {
+		hsm.Define(
+			"BadOnSetSlash",
+			hsm.State("s", hsm.Transition(hsm.OnSet("bad/name"), hsm.Target("../t"))),
+			hsm.State("t"),
+			hsm.Initial(hsm.Target("s")),
+		)
+	})
+}
+
+func TestCallOperationAndOnCallTransition(t *testing.T) {
+	callDataCh := make(chan hsm.CallData, 1)
+	kindCh := make(chan uint64, 1)
+	sourceCh := make(chan string, 1)
+	model := hsm.Define(
+		"CallHSM",
+		hsm.OperationDef("do", func(ctx context.Context, sm *CallOrderHSM, a int, b string) string {
+			sm.record("op")
+			return fmt.Sprintf("%d:%s", a, b)
+		}),
+		hsm.State("idle",
+			hsm.Transition(
+				hsm.OnCall("do"),
+				hsm.Target("../called"),
+				hsm.Effect(func(ctx context.Context, sm *CallOrderHSM, event hsm.Event) {
+					sm.record("effect")
+					if data, ok := event.Data.(hsm.CallData); ok {
+						callDataCh <- data
+					}
+					kindCh <- event.Kind
+					sourceCh <- event.Source
+				}),
+			),
+		),
+		hsm.State("called"),
+		hsm.Initial(hsm.Target("idle")),
+	)
+	sm := hsm.Started(context.Background(), &CallOrderHSM{}, &model)
+	result, err := sm.Call(context.Background(), "do", 1, "two")
+	if err != nil {
+		t.Fatal("call returned error", "err", err)
+	}
+	if result != "1:two" {
+		t.Fatal("call result mismatch", "result", result)
+	}
+	if sm.State() != "/CallHSM/called" {
+		t.Fatal("state did not transition on OnCall", "state", sm.State())
+	}
+	var data hsm.CallData
+	select {
+	case data = <-callDataCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for call data")
+	}
+	if data.Name != "do" {
+		t.Fatal("call data name mismatch", "name", data.Name)
+	}
+	if len(data.Args) != 2 {
+		t.Fatal("call data args length mismatch", "len", len(data.Args))
+	}
+	if data.Args[0].(int) != 1 || data.Args[1].(string) != "two" {
+		t.Fatal("call data args mismatch", "args", data.Args)
+	}
+	var kind uint64
+	select {
+	case kind = <-kindCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for call kind")
+	}
+	if kind != hsm.CallEventKind {
+		t.Fatal("call event kind mismatch", "kind", kind)
+	}
+	var source string
+	select {
+	case source = <-sourceCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for call source")
+	}
+	if source != "do" {
+		t.Fatal("call event source mismatch", "source", source)
+	}
+	if !slices.Equal(sm.orderSnapshot(), []string{"effect", "op"}) {
+		t.Fatal("call order mismatch", "order", sm.orderSnapshot())
+	}
+}
+
+func TestCallSignatureMatchingAndErrors(t *testing.T) {
+	type ctxKey string
+	opErr := errors.New("op error")
+	model := hsm.Define(
+		"CallSigHSM",
+		hsm.OperationDef("argsOnly", func(a int, b string) string {
+			return fmt.Sprintf("%d:%s", a, b)
+		}),
+		hsm.OperationDef("ctxOnly", func(ctx context.Context) string {
+			return ctx.Value(ctxKey("k")).(string)
+		}),
+		hsm.OperationDef("instanceOnly", func(sm *CallSigHSM) string {
+			sm.record("instanceOnly")
+			return "instance"
+		}),
+		hsm.OperationDef("methodExpr", (*CallSigHSM).methodExpr),
+		hsm.OperationDef("variadic", func(prefix string, nums ...int) int {
+			if prefix != "sum" {
+				return -1
+			}
+			total := 0
+			for _, n := range nums {
+				total += n
+			}
+			return total
+		}),
+		hsm.OperationDef("errorOnly", func() error {
+			return opErr
+		}),
+		hsm.State("idle"),
+		hsm.Initial(hsm.Target("idle")),
+	)
+	ctx := context.WithValue(context.Background(), ctxKey("k"), "ctx-ok")
+	sm := hsm.Started(ctx, &CallSigHSM{}, &model)
+	result, err := sm.Call(ctx, "argsOnly", 3, "ok")
+	if err != nil {
+		t.Fatal("argsOnly error", "err", err)
+	}
+	if result != "3:ok" {
+		t.Fatal("argsOnly result mismatch", "result", result)
+	}
+	result, err = sm.Call(ctx, "ctxOnly")
+	if err != nil {
+		t.Fatal("ctxOnly error", "err", err)
+	}
+	if result != "ctx-ok" {
+		t.Fatal("ctxOnly result mismatch", "result", result)
+	}
+	result, err = sm.Call(ctx, "instanceOnly")
+	if err != nil {
+		t.Fatal("instanceOnly error", "err", err)
+	}
+	if result != "instance" {
+		t.Fatal("instanceOnly result mismatch", "result", result)
+	}
+	result, err = sm.Call(ctx, "methodExpr", "x")
+	if err != nil {
+		t.Fatal("methodExpr error", "err", err)
+	}
+	if result != "method:x" {
+		t.Fatal("methodExpr result mismatch", "result", result)
+	}
+	result, err = sm.Call(ctx, "variadic", "sum", 1, 2, 3)
+	if err != nil {
+		t.Fatal("variadic error", "err", err)
+	}
+	if result != 6 {
+		t.Fatal("variadic result mismatch", "result", result)
+	}
+	_, err = sm.Call(ctx, "errorOnly")
+	if !errors.Is(err, opErr) {
+		t.Fatal("errorOnly error mismatch", "err", err)
+	}
+	_, err = sm.Call(ctx, "argsOnly", "bad", "ok")
+	if !errors.Is(err, hsm.ErrInvalidOperation) {
+		t.Fatal("expected invalid operation error for bad args", "err", err)
+	}
+	_, err = sm.Call(ctx, "missing")
+	if !errors.Is(err, hsm.ErrMissingOperation) {
+		t.Fatal("expected missing operation error", "err", err)
+	}
+	_, err = sm.Call(ctx, "")
+	if !errors.Is(err, hsm.ErrInvalidOperation) {
+		t.Fatal("expected invalid operation error for empty name", "err", err)
+	}
+	if !slices.Contains(sm.hitsSnapshot(), "instanceOnly") {
+		t.Fatal("instanceOnly did not record hit")
+	}
+	if !slices.Contains(sm.hitsSnapshot(), "methodExpr") {
+		t.Fatal("methodExpr did not record hit")
+	}
+}
+
+func TestCallValidation(t *testing.T) {
+	assertPanic(t, "operation name empty", func() {
+		hsm.Define(
+			"BadOpEmpty",
+			hsm.OperationDef("", func() {}),
+			hsm.State("s"),
+			hsm.Initial(hsm.Target("s")),
+		)
+	})
+	assertPanic(t, "operation name with slash", func() {
+		hsm.Define(
+			"BadOpSlash",
+			hsm.OperationDef("bad/name", func() {}),
+			hsm.State("s"),
+			hsm.Initial(hsm.Target("s")),
+		)
+	})
+	assertPanic(t, "operation duplicate", func() {
+		hsm.Define(
+			"BadOpDup",
+			hsm.OperationDef("dup", func() {}),
+			hsm.OperationDef("dup", func() {}),
+			hsm.State("s"),
+			hsm.Initial(hsm.Target("s")),
+		)
+	})
+	assertPanic(t, "operation not function", func() {
+		hsm.Define(
+			"BadOpType",
+			hsm.OperationDef("bad", 123),
+			hsm.State("s"),
+			hsm.Initial(hsm.Target("s")),
+		)
+	})
+	assertPanic(t, "OnCall outside Transition", func() {
+		hsm.Define(
+			"BadOnCallOwner",
+			hsm.State("s", hsm.OnCall("do")),
+			hsm.State("t"),
+			hsm.OperationDef("do", func() {}),
+			hsm.Initial(hsm.Target("s")),
+		)
+	})
+	assertPanic(t, "OnCall empty name", func() {
+		hsm.Define(
+			"BadOnCallEmpty",
+			hsm.OperationDef("do", func() {}),
+			hsm.State("s", hsm.Transition(hsm.OnCall(""), hsm.Target("../t"))),
+			hsm.State("t"),
+			hsm.Initial(hsm.Target("s")),
+		)
+	})
+	assertPanic(t, "OnCall name with slash", func() {
+		hsm.Define(
+			"BadOnCallSlash",
+			hsm.OperationDef("do", func() {}),
+			hsm.State("s", hsm.Transition(hsm.OnCall("bad/name"), hsm.Target("../t"))),
+			hsm.State("t"),
+			hsm.Initial(hsm.Target("s")),
+		)
+	})
+	assertPanic(t, "OnCall missing operation", func() {
+		hsm.Define(
+			"BadOnCallMissing",
+			hsm.State("s", hsm.Transition(hsm.OnCall("missing"), hsm.Target("../t"))),
+			hsm.State("t"),
+			hsm.Initial(hsm.Target("s")),
+		)
+	})
+}
+
+func TestHistoryRestoresShallowAndDeep(t *testing.T) {
+	toA1b := hsm.Event{Name: "toA1b"}
+	toB := hsm.Event{Name: "toB"}
+	backShallow := hsm.Event{Name: "backShallow"}
+	backDeep := hsm.Event{Name: "backDeep"}
+	model := hsm.Define(
+		"HistoryHSM",
+		hsm.State("A",
+			hsm.State("A1",
+				hsm.State("A1a"),
+				hsm.State("A1b"),
+				hsm.Initial(hsm.Target("A1a")),
+			),
+			hsm.State("A2"),
+			hsm.ShallowHistory("shallow"),
+			hsm.DeepHistory("deep"),
+			hsm.Initial(hsm.Target("A1")),
+		),
+		hsm.State("B"),
+		hsm.Transition(hsm.On(toA1b), hsm.Source("A/A1/A1a"), hsm.Target("A/A1/A1b")),
+		hsm.Transition(hsm.On(toB), hsm.Source("A/A1/A1b"), hsm.Target("B")),
+		hsm.Transition(hsm.On(backDeep), hsm.Source("B"), hsm.Target("A/deep")),
+		hsm.Transition(hsm.On(backShallow), hsm.Source("B"), hsm.Target("A/shallow")),
+		hsm.Initial(hsm.Target("A")),
+	)
+	sm := hsm.Started(context.Background(), &THSM{}, &model)
+	if sm.State() != "/HistoryHSM/A/A1/A1a" {
+		t.Fatal("initial state mismatch", "state", sm.State())
+	}
+	<-hsm.Dispatch(context.Background(), sm, toA1b)
+	if sm.State() != "/HistoryHSM/A/A1/A1b" {
+		t.Fatal("state mismatch after toA1b", "state", sm.State())
+	}
+	<-hsm.Dispatch(context.Background(), sm, toB)
+	if sm.State() != "/HistoryHSM/B" {
+		t.Fatal("state mismatch after toB", "state", sm.State())
+	}
+	<-hsm.Dispatch(context.Background(), sm, backDeep)
+	if sm.State() != "/HistoryHSM/A/A1/A1b" {
+		t.Fatal("deep history did not restore leaf state", "state", sm.State())
+	}
+	<-hsm.Dispatch(context.Background(), sm, toB)
+	<-hsm.Dispatch(context.Background(), sm, backShallow)
+	if sm.State() != "/HistoryHSM/A/A1/A1a" {
+		t.Fatal("shallow history did not restore parent initial", "state", sm.State())
+	}
+}
+
+func TestHistoryFallbackDefaultAndInitial(t *testing.T) {
+	toShallow := hsm.Event{Name: "toShallow"}
+	toDeep := hsm.Event{Name: "toDeep"}
+	model := hsm.Define(
+		"HistoryFallbackHSM",
+		hsm.State("A",
+			hsm.State("A1"),
+			hsm.State("A2"),
+			hsm.Initial(hsm.Target("A1")),
+			hsm.ShallowHistory("shallow", hsm.Transition(hsm.Target("A2"))),
+			hsm.DeepHistory("deep"),
+		),
+		hsm.State("B"),
+		hsm.Transition(hsm.On(toShallow), hsm.Source("B"), hsm.Target("A/shallow")),
+		hsm.Transition(hsm.On(toDeep), hsm.Source("B"), hsm.Target("A/deep")),
+		hsm.Initial(hsm.Target("B")),
+	)
+
+	t.Run("shallowUsesDefaultTransition", func(t *testing.T) {
+		sm := hsm.Started(context.Background(), &THSM{}, &model)
+		if sm.State() != "/HistoryFallbackHSM/B" {
+			t.Fatal("initial state mismatch", "state", sm.State())
+		}
+		<-hsm.Dispatch(context.Background(), sm, toShallow)
+		if sm.State() != "/HistoryFallbackHSM/A/A2" {
+			t.Fatal("shallow history did not use default transition", "state", sm.State())
+		}
+	})
+
+	t.Run("deepUsesParentInitial", func(t *testing.T) {
+		sm := hsm.Started(context.Background(), &THSM{}, &model)
+		if sm.State() != "/HistoryFallbackHSM/B" {
+			t.Fatal("initial state mismatch", "state", sm.State())
+		}
+		<-hsm.Dispatch(context.Background(), sm, toDeep)
+		if sm.State() != "/HistoryFallbackHSM/A/A1" {
+			t.Fatal("deep history did not use parent initial", "state", sm.State())
+		}
+	})
 }
 
 func TestLCA(t *testing.T) {
