@@ -60,42 +60,110 @@ import (
 	"github.com/stateforward/hsm.go/muid"
 )
 
+// Kind constants define the HSM type hierarchy using bit-packed inheritance.
+// Each Kind encodes its own ID and the IDs of its ancestor types, enabling
+// efficient type checking via kind.Is(). The hierarchy follows UML state machine
+// concepts where elements can inherit from multiple parent kinds.
 var (
-	NullKind            = kind.Make()
-	ElementKind         = kind.Make()
-	NamespaceKind       = kind.Make(ElementKind)
-	VertexKind          = kind.Make(ElementKind)
-	ConstraintKind      = kind.Make(ElementKind)
-	BehaviorKind        = kind.Make(ElementKind)
-	ConcurrentKind      = kind.Make(BehaviorKind)
-	StateMachineKind    = kind.Make(ConcurrentKind, NamespaceKind)
-	StateKind           = kind.Make(VertexKind, NamespaceKind)
-	RegionKind          = kind.Make(ElementKind)
-	TransitionKind      = kind.Make(ElementKind)
-	InternalKind        = kind.Make(TransitionKind)
-	ExternalKind        = kind.Make(TransitionKind)
-	LocalKind           = kind.Make(TransitionKind)
-	SelfKind            = kind.Make(TransitionKind)
-	EventKind           = kind.Make(ElementKind)
-	TimeEventKind       = kind.Make(EventKind)
+	// NullKind represents the absence of a kind or an uninitialized kind value.
+	NullKind = kind.Make()
+	// ElementKind is the base kind for all HSM elements. Every structural
+	// component in the state machine hierarchy derives from ElementKind.
+	ElementKind = kind.Make()
+	// NamespaceKind represents elements that can contain named children,
+	// enabling hierarchical name resolution for states and state machines.
+	NamespaceKind = kind.Make(ElementKind)
+	// VertexKind is the base kind for nodes in the state graph that can be
+	// sources or targets of transitions, including states and pseudostates.
+	VertexKind = kind.Make(ElementKind)
+	// ConstraintKind represents guard conditions that control transition firing.
+	ConstraintKind = kind.Make(ElementKind)
+	// BehaviorKind represents executable behaviors such as entry, exit, and
+	// transition effects that run during state machine execution.
+	BehaviorKind = kind.Make(ElementKind)
+	// ConcurrentKind represents behaviors that support concurrent execution
+	// of multiple orthogonal regions.
+	ConcurrentKind = kind.Make(BehaviorKind)
+	// StateMachineKind represents the top-level state machine container that
+	// owns regions, states, and transitions. Inherits from both ConcurrentKind
+	// (for orthogonal regions) and NamespaceKind (for named child lookup).
+	StateMachineKind = kind.Make(ConcurrentKind, NamespaceKind)
+	// StateKind represents a state vertex that can contain nested regions,
+	// entry/exit behaviors, and internal transitions. Inherits from VertexKind
+	// (as a graph node) and NamespaceKind (as a container for child elements).
+	StateKind = kind.Make(VertexKind, NamespaceKind)
+	// RegionKind represents an orthogonal region within a composite state or
+	// state machine, containing vertices and transitions.
+	RegionKind = kind.Make(ElementKind)
+	// TransitionKind is the base kind for all transitions between vertices,
+	// representing edges in the state graph.
+	TransitionKind = kind.Make(ElementKind)
+	// InternalKind represents internal transitions that execute without
+	// exiting or re-entering the containing state.
+	InternalKind = kind.Make(TransitionKind)
+	// ExternalKind represents external transitions that exit the source state
+	// and enter the target state, triggering exit and entry behaviors.
+	ExternalKind = kind.Make(TransitionKind)
+	// LocalKind represents local transitions that do not exit the containing
+	// composite state when transitioning between its substates.
+	LocalKind = kind.Make(TransitionKind)
+	// SelfKind represents self-transitions where the source and target are
+	// the same state, triggering exit and re-entry of that state.
+	SelfKind = kind.Make(TransitionKind)
+	// EventKind is the base kind for all events that can trigger transitions
+	// in the state machine.
+	EventKind = kind.Make(ElementKind)
+	// TimeEventKind represents events triggered after a specified duration,
+	// used for timeout-based transitions.
+	TimeEventKind = kind.Make(EventKind)
+	// CompletionEventKind represents events automatically generated when a
+	// state completes all its internal activities or reaches a final state.
 	CompletionEventKind = kind.Make(EventKind)
-	ChangeEventKind     = kind.Make(EventKind)
-	CallEventKind       = kind.Make(EventKind)
-	ErrorEventKind      = kind.Make(CompletionEventKind)
-	PseudostateKind     = kind.Make(VertexKind)
-	InitialKind         = kind.Make(PseudostateKind)
-	FinalStateKind      = kind.Make(StateKind)
-	ChoiceKind          = kind.Make(PseudostateKind)
-	ShallowHistoryKind  = kind.Make(PseudostateKind)
-	DeepHistoryKind     = kind.Make(PseudostateKind)
-	CustomKind          = kind.Make(ElementKind)
+	// ChangeEventKind represents events triggered when a boolean condition
+	// becomes true, enabling data-driven transitions.
+	ChangeEventKind = kind.Make(EventKind)
+	// CallEventKind represents events triggered by method calls on the state
+	// machine, enabling synchronous event dispatch.
+	CallEventKind = kind.Make(EventKind)
+	// ErrorEventKind represents events generated when an error occurs during
+	// state machine execution. Inherits from CompletionEventKind as errors
+	// typically complete the current processing.
+	ErrorEventKind = kind.Make(CompletionEventKind)
+	// PseudostateKind is the base kind for transient vertices that perform
+	// control flow logic without representing stable states.
+	PseudostateKind = kind.Make(VertexKind)
+	// InitialKind represents the initial pseudostate that indicates the
+	// default starting state when entering a region.
+	InitialKind = kind.Make(PseudostateKind)
+	// FinalStateKind represents a final state indicating that the enclosing
+	// region has completed its execution.
+	FinalStateKind = kind.Make(StateKind)
+	// ChoiceKind represents a choice pseudostate that evaluates guards to
+	// select among multiple outgoing transitions dynamically.
+	ChoiceKind = kind.Make(PseudostateKind)
+	// ShallowHistoryKind represents a shallow history pseudostate that
+	// remembers the most recently active direct substate of its region.
+	ShallowHistoryKind = kind.Make(PseudostateKind)
+	// DeepHistoryKind represents a deep history pseudostate that remembers
+	// the full active state configuration within its region recursively.
+	DeepHistoryKind = kind.Make(PseudostateKind)
+	// CustomKind represents user-defined element types for extending the
+	// HSM framework with application-specific constructs.
+	CustomKind = kind.Make(ElementKind)
 )
 
+// Error variables for common HSM error conditions.
+// These sentinel errors can be checked using errors.Is for specific error handling.
 var (
-	ErrNilHSM           = errors.New("hsm is nil")
-	ErrInvalidState     = errors.New("invalid state")
-	ErrMissingHSM       = errors.New("missing hsm in context")
+	// ErrNilHSM is returned when an operation is attempted on a nil state machine.
+	ErrNilHSM = errors.New("hsm is nil")
+	// ErrInvalidState is returned when attempting to access or transition to an invalid state.
+	ErrInvalidState = errors.New("invalid state")
+	// ErrMissingHSM is returned when the HSM instance cannot be found in the context.
+	ErrMissingHSM = errors.New("missing hsm in context")
+	// ErrMissingOperation is returned when an operation callback is required but not provided.
 	ErrMissingOperation = errors.New("missing operation")
+	// ErrInvalidOperation is returned when an operation callback has an unsupported function signature.
 	ErrInvalidOperation = errors.New("invalid operation")
 )
 
@@ -255,7 +323,16 @@ func (transition *transition) Target() string {
 
 /******* Behavior *******/
 
+// Operation is a function type that performs an action on a state machine.
+// Operations are used for state entry/exit behaviors, transition effects,
+// and activity functions. They receive the current context, state machine
+// instance, and the triggering event.
 type Operation[T Instance] func(ctx context.Context, hsm T, event Event)
+
+// Expression is a function type that evaluates a condition on a state machine.
+// Expressions are used for transition guards to determine whether a transition
+// should be taken. They receive the current context, state machine instance,
+// and the triggering event, returning true if the condition is satisfied.
 type Expression[T Instance] func(ctx context.Context, hsm T, event Event) bool
 
 type behavior[T Instance] struct {
@@ -322,23 +399,34 @@ func (e Event) WithDataAndID(data any, id string) Event {
 	}
 }
 
+// Built-in event types and special duration constants used by the HSM runtime.
 var (
+	// InitialEvent is the completion event dispatched when a state machine starts.
+	// It triggers the initial transition from the initial pseudostate to the first active state.
 	InitialEvent = Event{
 		Name: "hsm_initial",
 		Kind: CompletionEventKind,
 	}
+	// ErrorEvent is dispatched when an error occurs during state machine execution,
+	// such as panics in concurrent behaviors or timeout errors. Use On(ErrorEvent) to handle errors.
 	ErrorEvent = Event{
 		Name: "hsm_error",
 		Kind: ErrorEventKind,
 	}
+	// AnyEvent is a wildcard event that matches any event not explicitly handled.
+	// Transitions using On(AnyEvent) are only taken when no specific event transition matches.
 	AnyEvent = Event{
 		Name: "*",
 		Kind: EventKind,
 	}
+	// FinalEvent is the completion event dispatched when a state reaches its final state.
+	// It triggers exit behaviors and propagates completion to parent regions.
 	FinalEvent = Event{
 		Name: "hsm_final",
 		Kind: CompletionEventKind,
 	}
+	// InfiniteDuration represents an unbounded duration for timeout operations.
+	// Use this when a behavior should run indefinitely without timing out.
 	InfiniteDuration = time.Duration(-1)
 )
 
@@ -679,6 +767,10 @@ func LCA(a, b string) string {
 	return LCA(path.Dir(a), path.Dir(b))
 }
 
+// IsAncestor checks whether current is an ancestor of target in the state hierarchy.
+// It returns true if current appears in the path from the root to target's parent.
+// Returns false if current equals target, or if either path is "." (relative root).
+// The root path "/" is considered an ancestor of all other paths.
 func IsAncestor(current, target string) bool {
 	current = path.Clean(current)
 	target = path.Clean(target)
@@ -2852,6 +2944,11 @@ func DispatchTo(ctx context.Context, event Event, maybeIds ...string) <-chan str
 	return signal
 }
 
+// AfterProcess returns a channel that closes when event processing completes.
+// If an event is provided, the channel closes after that specific event is processed.
+// If no event is provided, the channel closes after the next processing cycle completes.
+// This is useful for synchronizing with state machine execution in tests or
+// when coordinating external operations with state transitions.
 func AfterProcess(ctx context.Context, hsm Instance, maybeEvent ...Event) <-chan struct{} {
 	if len(maybeEvent) > 0 {
 		ch, _ := hsm.channels().processed.LoadOrStore(maybeEvent[0].Name, make(chan struct{}))
@@ -2861,21 +2958,34 @@ func AfterProcess(ctx context.Context, hsm Instance, maybeEvent ...Event) <-chan
 	}
 }
 
+// AfterDispatch returns a channel that closes when the specified event is dispatched.
+// Unlike AfterProcess, this signals when the event is added to the queue, not when
+// processing completes. Useful for confirming event delivery before processing begins.
 func AfterDispatch(ctx context.Context, hsm Instance, event Event) <-chan struct{} {
 	ch, _ := hsm.channels().dispatched.LoadOrStore(event.Name, make(chan struct{}))
 	return ch.(chan struct{})
 }
 
+// AfterEntry returns a channel that closes when the specified state is entered.
+// The state parameter should be the fully qualified state path (e.g., "/parent/child").
+// Useful for waiting until a particular state becomes active.
 func AfterEntry(ctx context.Context, hsm Instance, state string) <-chan struct{} {
 	ch, _ := hsm.channels().entered.LoadOrStore(state, make(chan struct{}))
 	return ch.(chan struct{})
 }
 
+// AfterExit returns a channel that closes when the specified state is exited.
+// The state parameter should be the fully qualified state path (e.g., "/parent/child").
+// Useful for waiting until a particular state is no longer active.
 func AfterExit(ctx context.Context, hsm Instance, state string) <-chan struct{} {
 	ch, _ := hsm.channels().exited.LoadOrStore(state, make(chan struct{}))
 	return ch.(chan struct{})
 }
 
+// AfterExecuted returns a channel that closes when the specified state's
+// do-activity has completed execution. The state parameter should be the
+// fully qualified state path. Useful for waiting until a state's background
+// activity finishes.
 func AfterExecuted(ctx context.Context, hsm Instance, state string) <-chan struct{} {
 	ch, _ := hsm.channels().executed.LoadOrStore(state, make(chan struct{}))
 	return ch.(chan struct{})
@@ -2897,6 +3007,10 @@ func FromContext(ctx context.Context) (Instance, bool) {
 	return nil, false
 }
 
+// InstancesFromContext retrieves all state machine instances from a context.
+// Returns a slice of instances and a boolean indicating whether any were found.
+// This is useful when multiple state machines share a context and you need
+// to access or iterate over all of them.
 func InstancesFromContext(ctx context.Context) ([]Instance, bool) {
 	instancesPointer, ok := ctx.Value(Keys.Instances).(*sync.Map)
 	if !ok || instancesPointer == nil {
@@ -2922,25 +3036,40 @@ func Stop(ctx context.Context, hsm Instance) <-chan struct{} {
 	return hsm.stop(ctx)
 }
 
+// Restart stops a state machine and restarts it from the initial state.
+// Optional data can be passed to reinitialize the state machine's data field.
+// Returns a channel that closes when the restart completes.
 func Restart(ctx context.Context, hsm Instance, maybeData ...any) <-chan struct{} {
 	return hsm.restart(ctx, maybeData...)
 }
 
+// ID returns the unique identifier of a state machine instance.
+// The ID is assigned when the state machine is created and remains
+// constant throughout its lifecycle.
 func ID(hsm Instance) string {
 	snapshot := hsm.takeSnapshot()
 	return snapshot.ID
 }
 
+// QualifiedName returns the fully qualified name of a state machine instance.
+// For nested state machines, this includes the parent path (e.g., "/parent/child").
+// For top-level state machines, this is typically just the name with a leading slash.
 func QualifiedName(hsm Instance) string {
 	snapshot := hsm.takeSnapshot()
 	return snapshot.QualifiedName
 }
 
+// Name returns the simple name of a state machine instance (without path prefix).
+// This extracts the base name from the qualified name, e.g., "child" from "/parent/child".
 func Name(hsm Instance) string {
 	snapshot := hsm.takeSnapshot()
 	return path.Base(snapshot.QualifiedName)
 }
 
+// TakeSnapshot captures the current state of a state machine instance.
+// The returned Snapshot contains the ID, qualified name, current state,
+// data, and other attributes representing the instance at this moment.
+// Useful for debugging, logging, or persisting state machine state.
 func TakeSnapshot(ctx context.Context, hsm Instance) Snapshot {
 	return hsm.takeSnapshot()
 }
