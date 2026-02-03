@@ -2852,47 +2852,6 @@ func DispatchTo(ctx context.Context, event Event, maybeIds ...string) <-chan str
 	return signal
 }
 
-// func Propagate(ctx context.Context, event Event) <-chan struct{} {
-// 	hsm, ok := FromContext(ctx)
-// 	if !ok {
-// 		return closedChannel
-// 	}
-// 	active := hsm.Context()
-// 	owner, ok := FromContext(active.context)
-// 	if !ok {
-// 		return closedChannel
-// 	}
-// 	return owner.dispatch(ctx, event)
-// }
-
-// func PropagateAll(ctx context.Context, event Event) <-chan struct{} {
-// 	hsm, ok := FromContext(ctx)
-// 	if !ok {
-// 		return closedChannel
-// 	}
-// 	signal := make(chan struct{})
-// 	go func() {
-// 		defer close(signal)
-// 		signals := make(map[any]<-chan struct{})
-// 		active, ok := FromContext(hsm.Context().context)
-// 		for ok {
-// 			signals[active] = active.dispatch(ctx, event)
-// 			active, ok = FromContext(active.Context().context)
-// 		}
-// 		for len(signals) > 0 {
-// 			for i, ch := range signals {
-// 				select {
-// 				case <-ch:
-// 					delete(signals, i)
-// 				case <-ctx.Done():
-// 					return
-// 				}
-// 			}
-// 		}
-// 	}()
-// 	return signal
-// }
-
 func AfterProcess(ctx context.Context, hsm Instance, maybeEvent ...Event) <-chan struct{} {
 	if len(maybeEvent) > 0 {
 		ch, _ := hsm.channels().processed.LoadOrStore(maybeEvent[0].Name, make(chan struct{}))
