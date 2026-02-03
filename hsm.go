@@ -56,8 +56,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/stateforward/hsm-go/kind"
-	"github.com/stateforward/hsm-go/muid"
+	"github.com/stateforward/hsm.go/kind"
+	"github.com/stateforward/hsm.go/muid"
 )
 
 var (
@@ -1755,6 +1755,7 @@ type Snapshot struct {
 	ID            string
 	QualifiedName string
 	State         string
+	Attributes    map[string]any
 	QueueLen      int
 	Events        []EventDetail
 }
@@ -1869,8 +1870,7 @@ type hsm[T Instance] struct {
 	model          *Model
 	active         map[string]*active
 	queue          queue
-	attributes     map[string]any
-	attrMutex      sync.RWMutex
+	attributes     sync.Map
 	historyShallow map[string]string
 	historyDeep    map[string]string
 	instance       T
@@ -1947,7 +1947,6 @@ func New[T Instance](sm T, model *Model, maybeConfig ...Config) T {
 		instance:       sm,
 		queue:          queue{},
 		active:         map[string]*active{},
-		attributes:     map[string]any{},
 		historyShallow: map[string]string{},
 		historyDeep:    map[string]string{},
 	}
@@ -1969,7 +1968,7 @@ func New[T Instance](sm T, model *Model, maybeConfig ...Config) T {
 	}
 	for name, attr := range model.attributes {
 		if attr != nil && attr.hasDefault {
-			hsm.attributes[name] = attr.defaultValue
+			hsm.attributes.Store(name, attr.defaultValue)
 		}
 	}
 	hsm.behavior.operation = func(ctx context.Context, _ T, event Event) {
@@ -2075,10 +2074,7 @@ func (sm *hsm[T]) Get(name string) (any, bool) {
 	if sm == nil {
 		return nil, false
 	}
-	sm.attrMutex.RLock()
-	defer sm.attrMutex.RUnlock()
-	value, ok := sm.attributes[name]
-	return value, ok
+	return sm.attributes.Load(name)
 }
 
 func (sm *hsm[T]) Set(ctx context.Context, name string, value any) <-chan struct{} {
@@ -2092,10 +2088,8 @@ func (sm *hsm[T]) setAttribute(ctx context.Context, name string, value any, emit
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	sm.attrMutex.Lock()
-	old, exists := sm.attributes[name]
-	sm.attributes[name] = value
-	sm.attrMutex.Unlock()
+	old, exists := sm.attributes.Load(name)
+	sm.attributes.Store(name, value)
 	if !emit {
 		return closedChannel
 	}
@@ -2713,6 +2707,19 @@ func (sm *hsm[T]) takeSnapshot() Snapshot {
 		state = sm.model
 	}
 
+	var attributes map[string]any
+	sm.attributes.Range(func(key, value any) bool {
+		name, ok := key.(string)
+		if !ok {
+			return true
+		}
+		if attributes == nil {
+			attributes = map[string]any{}
+		}
+		attributes[name] = value
+		return true
+	})
+
 	var events []EventDetail
 	currentQualifiedName := state.QualifiedName()
 
@@ -2745,6 +2752,7 @@ func (sm *hsm[T]) takeSnapshot() Snapshot {
 		ID:            sm.behavior.id,
 		QualifiedName: sm.behavior.qualifiedName,
 		State:         state.QualifiedName(),
+		Attributes:    attributes,
 		QueueLen:      sm.queue.len(),
 		Events:        events,
 	}
