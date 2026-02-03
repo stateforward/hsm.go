@@ -165,6 +165,8 @@ var (
 	ErrMissingOperation = errors.New("missing operation")
 	// ErrInvalidOperation is returned when an operation callback has an unsupported function signature.
 	ErrInvalidOperation = errors.New("invalid operation")
+	// ErrAlreadyStarted is returned when a state machine has already been started.
+	ErrAlreadyStarted = errors.New("hsm already started")
 )
 
 /******* Element *******/
@@ -323,31 +325,31 @@ func (transition *transition) Target() string {
 
 /******* Behavior *******/
 
-// Operation is a function type that performs an action on a state machine.
+// OperationFunc is a function type that performs an action on a state machine.
 // Operations are used for state entry/exit behaviors, transition effects,
 // and activity functions. They receive the current context, state machine
 // instance, and the triggering event.
-type Operation[T Instance] func(ctx context.Context, hsm T, event Event)
+type OperationFunc[T Instance] func(ctx context.Context, hsm T, event Event)
 
-// Expression is a function type that evaluates a condition on a state machine.
+// ExpressionFunc is a function type that evaluates a condition on a state machine.
 // Expressions are used for transition guards to determine whether a transition
 // should be taken. They receive the current context, state machine instance,
 // and the triggering event, returning true if the condition is satisfied.
-type Expression[T Instance] func(ctx context.Context, hsm T, event Event) bool
+type ExpressionFunc[T Instance] func(ctx context.Context, hsm T, event Event) bool
 
 type behavior[T Instance] struct {
 	element
-	operation Operation[T]
+	operation OperationFunc[T]
 }
 
 /******* Constraint *******/
 
 type constraint[T Instance] struct {
 	element
-	expression Expression[T]
+	expression ExpressionFunc[T]
 }
 
-/******* Attribute & Operation *******/
+/******* Attribute & OperationFunc *******/
 
 type attribute struct {
 	name         string
@@ -430,17 +432,38 @@ var (
 	InfiniteDuration = time.Duration(-1)
 )
 
-const (
-	attributeEventPrefix = "__attr__:"
-	callEventPrefix      = "__call__:"
-)
-
-func attributeEventName(name string) string {
-	return attributeEventPrefix + name
+func qualifyModelName(modelQualified, name string) string {
+	if name == "" {
+		return ""
+	}
+	if path.IsAbs(name) {
+		return path.Clean(name)
+	}
+	return path.Join(modelQualified, name)
 }
 
-func callEventName(name string) string {
-	return callEventPrefix + name
+func registerEvent(traceback func(error), model *Model, event *Event) {
+	if event == nil {
+		return
+	}
+	if model.events == nil {
+		model.events = map[string]*Event{}
+	}
+	if existing := model.events[event.Name]; existing != nil {
+		existingKind := existing.Kind
+		if existingKind == 0 {
+			existingKind = EventKind
+		}
+		newKind := event.Kind
+		if newKind == 0 {
+			newKind = EventKind
+		}
+		if existingKind != newKind {
+			traceback(fmt.Errorf("event \"%s\" already defined with a different kind", event.Name))
+		}
+		return
+	}
+	model.events[event.Name] = event
 }
 
 // AttributeChange is the payload for attribute change events.
@@ -1112,60 +1135,51 @@ func Attribute(name string, maybeDefault ...any) RedefinableElement {
 		if name == "" {
 			traceback(fmt.Errorf("attribute name cannot be empty"))
 		}
-		if strings.Contains(name, "/") {
-			traceback(fmt.Errorf("attribute name cannot contain '/'"))
-		}
+		qualifiedName := qualifyModelName(model.qualifiedName, name)
 		if model.attributes == nil {
 			model.attributes = map[string]*attribute{}
 		}
-		if _, exists := model.attributes[name]; exists {
-			traceback(fmt.Errorf("attribute \"%s\" already defined", name))
+		if _, exists := model.attributes[qualifiedName]; exists {
+			traceback(fmt.Errorf("attribute \"%s\" already defined", qualifiedName))
 		}
-		attr := &attribute{name: name}
+		attr := &attribute{name: qualifiedName}
 		if len(maybeDefault) > 0 {
 			attr.defaultValue = maybeDefault[0]
 			attr.hasDefault = true
 		}
-		model.attributes[name] = attr
+		model.attributes[qualifiedName] = attr
 		return nil
 	}
 }
 
-// OperationDef declares a named callable for Call()/OnCall().
+// Operation declares a named callable for Call()/OnCall().
 // Supported callables include function values and method expressions.
-func OperationDef(name string, fn any) RedefinableElement {
+func Operation(name string, fn any) RedefinableElement {
 	traceback := traceback()
 	return func(model *Model, stack []Element) Element {
 		if name == "" {
 			traceback(fmt.Errorf("operation name cannot be empty"))
 		}
-		if strings.Contains(name, "/") {
-			traceback(fmt.Errorf("operation name cannot contain '/'"))
-		}
+		qualifiedName := qualifyModelName(model.qualifiedName, name)
 		if model.operations == nil {
 			model.operations = map[string]*operationDef{}
 		}
-		if _, exists := model.operations[name]; exists {
-			traceback(fmt.Errorf("operation \"%s\" already defined", name))
+		if _, exists := model.operations[qualifiedName]; exists {
+			traceback(fmt.Errorf("operation \"%s\" already defined", qualifiedName))
 		}
 		fnValue := reflect.ValueOf(fn)
 		fnType := fnValue.Type()
 		if !fnValue.IsValid() || fnType.Kind() != reflect.Func {
-			traceback(fmt.Errorf("operation \"%s\" must be a function", name))
+			traceback(fmt.Errorf("operation \"%s\" must be a function", qualifiedName))
 		}
-		model.operations[name] = &operationDef{
-			name:    name,
+		model.operations[qualifiedName] = &operationDef{
+			name:    qualifiedName,
 			fn:      fn,
 			fnValue: fnValue,
 			fnType:  fnType,
 		}
 		return nil
 	}
-}
-
-// Op is a shorthand for OperationDef.
-func Op(name string, fn any) RedefinableElement {
-	return OperationDef(name, fn)
 }
 
 // Initial defines the initial state for a composite state or the entire state machine.
@@ -1461,7 +1475,7 @@ func On[T interface{ *Event | Event }](events ...T) RedefinableElement {
 				event = e
 			}
 			transition.events = append(transition.events, name)
-			model.events[name] = event
+			registerEvent(traceback, model, event)
 		}
 		return owner
 	}
@@ -1479,22 +1493,20 @@ func OnSet(name string) RedefinableElement {
 		if name == "" {
 			traceback(fmt.Errorf("OnSet() requires a non-empty attribute name"))
 		}
-		if strings.Contains(name, "/") {
-			traceback(fmt.Errorf("attribute name cannot contain '/'"))
-		}
+		qualifiedName := qualifyModelName(model.qualifiedName, name)
 		transition := owner.(*transition)
-		eventName := attributeEventName(name)
+		eventName := qualifiedName
 		transition.events = append(transition.events, eventName)
-		model.events[eventName] = &Event{
+		registerEvent(traceback, model, &Event{
 			Kind:   ChangeEventKind,
 			Name:   eventName,
-			Source: name,
-		}
+			Source: qualifiedName,
+		})
 		if model.attributes == nil {
 			model.attributes = map[string]*attribute{}
 		}
-		if _, exists := model.attributes[name]; !exists {
-			model.attributes[name] = &attribute{name: name}
+		if _, exists := model.attributes[qualifiedName]; !exists {
+			model.attributes[qualifiedName] = &attribute{name: qualifiedName}
 		}
 		return owner
 	}
@@ -1511,20 +1523,18 @@ func OnCall(name string) RedefinableElement {
 		if name == "" {
 			traceback(fmt.Errorf("OnCall() requires a non-empty operation name"))
 		}
-		if strings.Contains(name, "/") {
-			traceback(fmt.Errorf("operation name cannot contain '/'"))
-		}
+		qualifiedName := qualifyModelName(model.qualifiedName, name)
 		transition := owner.(*transition)
-		eventName := callEventName(name)
+		eventName := qualifiedName
 		transition.events = append(transition.events, eventName)
-		model.events[eventName] = &Event{
+		registerEvent(traceback, model, &Event{
 			Kind:   CallEventKind,
 			Name:   eventName,
-			Source: name,
-		}
+			Source: qualifiedName,
+		})
 		model.push(func(model *Model, stack []Element) Element {
-			if model.operations == nil || model.operations[name] == nil {
-				traceback(fmt.Errorf("missing operation \"%s\" for OnCall()", name))
+			if model.operations == nil || model.operations[qualifiedName] == nil {
+				traceback(fmt.Errorf("missing operation \"%s\" for OnCall()", qualifiedName))
 			}
 			return owner
 		})
@@ -1923,6 +1933,231 @@ type after struct {
 	executed   sync.Map
 }
 
+// Group is a composite instance that forwards operations to multiple instances.
+// It flattens nested groups and broadcasts events to all members.
+type Group struct {
+	instances []Instance
+	after     after
+	id        string
+	context   context.Context
+	cancel    context.CancelFunc
+}
+
+// NewGroup creates a new group from the provided instances.
+// Nested groups are flattened.
+func NewGroup(instances ...Instance) *Group {
+	group := &Group{}
+	for _, instance := range instances {
+		if instance == nil {
+			continue
+		}
+		if nested, ok := instance.(*Group); ok && nested != nil {
+			if isStarted(nested) {
+				panic(ErrAlreadyStarted)
+			}
+			group.instances = append(group.instances, nested.instances...)
+			continue
+		}
+		if isStarted(instance) {
+			panic(ErrAlreadyStarted)
+		}
+		group.instances = append(group.instances, instance)
+	}
+	return group
+}
+
+// Instances returns a snapshot of the group's instances.
+func (group *Group) Instances() []Instance {
+	if group == nil || len(group.instances) == 0 {
+		return nil
+	}
+	return slices.Clone(group.instances)
+}
+
+func (group *Group) State() string {
+	return ""
+}
+
+func (group *Group) Context() context.Context {
+	if group == nil {
+		return context.Background()
+	}
+	if group.context != nil {
+		return group.context
+	}
+	if len(group.instances) == 0 {
+		return context.Background()
+	}
+	return group.instances[0].Context()
+}
+
+func (group *Group) Get(name string) (any, bool) {
+	if group == nil || len(group.instances) == 0 {
+		return nil, false
+	}
+	return group.instances[0].Get(name)
+}
+
+func (group *Group) Set(ctx context.Context, name string, value any) <-chan struct{} {
+	if group == nil || len(group.instances) == 0 {
+		return closedChannel
+	}
+	return group.waitAll(ctx, func(instance Instance) <-chan struct{} {
+		return instance.Set(ctx, name, value)
+	})
+}
+
+func (group *Group) Call(ctx context.Context, name string, args ...any) (any, error) {
+	if group == nil || len(group.instances) == 0 {
+		return nil, ErrMissingHSM
+	}
+	return group.instances[0].Call(ctx, name, args...)
+}
+
+func (group *Group) channels() *after {
+	if group == nil {
+		return &after{}
+	}
+	return &group.after
+}
+
+func (group *Group) takeSnapshot() Snapshot {
+	if group == nil {
+		return Snapshot{}
+	}
+	return Snapshot{
+		ID:            group.id,
+		QualifiedName: "",
+		State:         "",
+		Attributes:    nil,
+		QueueLen:      0,
+		Events:        nil,
+	}
+}
+
+func (group *Group) wait() <-chan struct{} {
+	if group == nil || len(group.instances) == 0 {
+		return closedChannel
+	}
+	return group.waitAll(context.Background(), func(instance Instance) <-chan struct{} {
+		return instance.wait()
+	})
+}
+
+func (group *Group) start(ctx context.Context, instance Instance, event *Event) {
+	if group == nil || len(group.instances) == 0 {
+		return
+	}
+	if isStarted(group) {
+		panic(ErrAlreadyStarted)
+	}
+	for _, child := range group.instances {
+		if isStarted(child) {
+			panic(ErrAlreadyStarted)
+		}
+	}
+	instances, ok := ctx.Value(Keys.Instances).(*sync.Map)
+	if !ok || instances == nil {
+		instances = &sync.Map{}
+	}
+	group.context, group.cancel = context.WithCancel(context.WithValue(context.WithValue(ctx, Keys.Instances, instances), Keys.HSM, group))
+	for _, child := range group.instances {
+		if child == nil {
+			continue
+		}
+		child.start(group.context, child, event)
+	}
+}
+
+func (group *Group) dispatch(ctx context.Context, event Event) <-chan struct{} {
+	if group == nil || len(group.instances) == 0 {
+		return closedChannel
+	}
+	if event.Kind == 0 {
+		event.Kind = EventKind
+	}
+	if ch, ok := group.after.dispatched.LoadAndDelete(event.Name); ok {
+		close(ch.(chan struct{}))
+	}
+	return group.waitAll(ctx, func(instance Instance) <-chan struct{} {
+		return instance.dispatch(ctx, event)
+	}, func() {
+		if ch, ok := group.after.processed.LoadAndDelete(event.Name); ok {
+			close(ch.(chan struct{}))
+		}
+	})
+}
+
+func (group *Group) bind(instance Instance) {}
+
+func (group *Group) stop(ctx context.Context) <-chan struct{} {
+	if group == nil || len(group.instances) == 0 {
+		return closedChannel
+	}
+	return group.waitAll(ctx, func(instance Instance) <-chan struct{} {
+		return instance.stop(ctx)
+	}, func() {
+		if group.cancel != nil {
+			group.cancel()
+		}
+	})
+}
+
+func (group *Group) restart(ctx context.Context, maybeData ...any) <-chan struct{} {
+	if group == nil || len(group.instances) == 0 {
+		return closedChannel
+	}
+	return group.waitAll(ctx, func(instance Instance) <-chan struct{} {
+		return instance.restart(ctx, maybeData...)
+	})
+}
+
+func (group *Group) waitAll(ctx context.Context, request func(instance Instance) <-chan struct{}, onDone ...func()) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var wg sync.WaitGroup
+		for _, instance := range group.instances {
+			if instance == nil {
+				continue
+			}
+			ch := request(instance)
+			wg.Add(1)
+			go func(ch <-chan struct{}) {
+				defer wg.Done()
+				if ch == nil {
+					return
+				}
+				select {
+				case <-ch:
+				case <-ctx.Done():
+				}
+			}(ch)
+		}
+		wg.Wait()
+		if ctx.Err() != nil {
+			return
+		}
+		for _, callback := range onDone {
+			if callback != nil {
+				callback()
+			}
+		}
+	}()
+	return done
+}
+
+func isStarted(instance Instance) bool {
+	if instance == nil {
+		return false
+	}
+	ctx := instance.Context()
+	if ctx == nil {
+		return false
+	}
+	return ctx.Value(Keys.HSM) != nil
+}
+
 // Instance represents an active state machine instance that can process events and track state.
 // It provides methods for event dispatch and state management.
 type Instance interface {
@@ -2155,7 +2390,8 @@ func (sm *hsm[T]) Get(name string) (any, bool) {
 	if sm == nil {
 		return nil, false
 	}
-	return sm.attributes.Load(name)
+	qualifiedName := qualifyModelName(sm.model.qualifiedName, name)
+	return sm.attributes.Load(qualifiedName)
 }
 
 func (sm *hsm[T]) Set(ctx context.Context, name string, value any) <-chan struct{} {
@@ -2169,8 +2405,9 @@ func (sm *hsm[T]) setAttribute(ctx context.Context, name string, value any, emit
 	if ctx == nil {
 		ctx = sm.context
 	}
-	old, exists := sm.attributes.Load(name)
-	sm.attributes.Store(name, value)
+	qualifiedName := qualifyModelName(sm.model.qualifiedName, name)
+	old, exists := sm.attributes.Load(qualifiedName)
+	sm.attributes.Store(qualifiedName, value)
 	if !emit {
 		return closedChannel
 	}
@@ -2179,10 +2416,10 @@ func (sm *hsm[T]) setAttribute(ctx context.Context, name string, value any, emit
 	}
 	event := Event{
 		Kind:   ChangeEventKind,
-		Name:   attributeEventName(name),
-		Source: name,
+		Name:   qualifiedName,
+		Source: qualifiedName,
 		Data: AttributeChange{
-			Name: name,
+			Name: qualifiedName,
 			Old:  old,
 			New:  value,
 		},
@@ -2200,16 +2437,17 @@ func (sm *hsm[T]) Call(ctx context.Context, name string, args ...any) (any, erro
 	if name == "" {
 		return nil, ErrInvalidOperation
 	}
-	op := sm.model.operations[name]
+	qualifiedName := qualifyModelName(sm.model.qualifiedName, name)
+	op := sm.model.operations[qualifiedName]
 	if op == nil {
 		return nil, ErrMissingOperation
 	}
 	event := Event{
 		Kind:   CallEventKind,
-		Name:   callEventName(name),
-		Source: name,
+		Name:   qualifiedName,
+		Source: qualifiedName,
 		Data: CallData{
-			Name: name,
+			Name: qualifiedName,
 			Args: args,
 		},
 	}

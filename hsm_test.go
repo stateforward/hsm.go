@@ -116,6 +116,16 @@ func assertPanic(t *testing.T, name string, fn func()) {
 	fn()
 }
 
+func assertNoPanic(t *testing.T, name string, fn func()) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("unexpected panic for %s: %v", name, r)
+		}
+	}()
+	fn()
+}
+
 func TestComplex(t *testing.T) {
 	trace := &Trace{
 		mutex: &sync.Mutex{},
@@ -830,7 +840,7 @@ func TestAttributeDefaultAndOnSet(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for attribute change event")
 	}
-	if change.Name != "count" {
+	if change.Name != "/AttrHSM/count" {
 		t.Fatal("attribute change name mismatch", "name", change.Name)
 	}
 	oldValue, ok := change.Old.(int)
@@ -884,7 +894,7 @@ func TestOnSetImplicitAttribute(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for implicit attribute change")
 	}
-	if change.Name != "dynamic" {
+	if change.Name != "/AttrImplicitHSM/dynamic" {
 		t.Fatal("implicit attribute change name mismatch", "name", change.Name)
 	}
 	if change.Old != nil {
@@ -905,13 +915,17 @@ func TestAttributeValidation(t *testing.T) {
 			hsm.Initial(hsm.Target("s")),
 		)
 	})
-	assertPanic(t, "attribute name with slash", func() {
-		hsm.Define(
-			"BadAttrSlash",
-			hsm.Attribute("bad/name"),
+	assertNoPanic(t, "attribute name with slash", func() {
+		model := hsm.Define(
+			"AttrSlash",
+			hsm.Attribute("bad/name", 7),
 			hsm.State("s"),
 			hsm.Initial(hsm.Target("s")),
 		)
+		sm := hsm.Started(context.Background(), &AttrHSM{}, &model)
+		if value, ok := sm.Get("bad/name"); !ok || value.(int) != 7 {
+			t.Fatal("expected qualified attribute default", "value", value, "ok", ok)
+		}
 	})
 	assertPanic(t, "duplicate attribute", func() {
 		hsm.Define(
@@ -937,13 +951,18 @@ func TestAttributeValidation(t *testing.T) {
 			hsm.Initial(hsm.Target("s")),
 		)
 	})
-	assertPanic(t, "OnSet name with slash", func() {
-		hsm.Define(
-			"BadOnSetSlash",
+	assertNoPanic(t, "OnSet name with slash", func() {
+		model := hsm.Define(
+			"OnSetSlash",
 			hsm.State("s", hsm.Transition(hsm.OnSet("bad/name"), hsm.Target("../t"))),
 			hsm.State("t"),
 			hsm.Initial(hsm.Target("s")),
 		)
+		sm := hsm.Started(context.Background(), &AttrHSM{}, &model)
+		<-sm.Set(context.Background(), "bad/name", 1)
+		if sm.State() != "/OnSetSlash/t" {
+			t.Fatal("state did not transition on slashed attribute", "state", sm.State())
+		}
 	})
 }
 
@@ -953,7 +972,7 @@ func TestCallOperationAndOnCallTransition(t *testing.T) {
 	sourceCh := make(chan string, 1)
 	model := hsm.Define(
 		"CallHSM",
-		hsm.OperationDef("do", func(ctx context.Context, sm *CallOrderHSM, a int, b string) string {
+		hsm.Operation("do", func(ctx context.Context, sm *CallOrderHSM, a int, b string) string {
 			sm.record("op")
 			return fmt.Sprintf("%d:%s", a, b)
 		}),
@@ -997,7 +1016,7 @@ func TestCallOperationAndOnCallTransition(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for call data")
 	}
-	if data.Name != "do" {
+	if data.Name != "/CallHSM/do" {
 		t.Fatal("call data name mismatch", "name", data.Name)
 	}
 	if len(data.Args) != 2 {
@@ -1021,7 +1040,7 @@ func TestCallOperationAndOnCallTransition(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for call source")
 	}
-	if source != "do" {
+	if source != "/CallHSM/do" {
 		t.Fatal("call event source mismatch", "source", source)
 	}
 	order := sm.orderSnapshot()
@@ -1035,18 +1054,18 @@ func TestCallSignatureMatchingAndErrors(t *testing.T) {
 	opErr := errors.New("op error")
 	model := hsm.Define(
 		"CallSigHSM",
-		hsm.OperationDef("argsOnly", func(a int, b string) string {
+		hsm.Operation("argsOnly", func(a int, b string) string {
 			return fmt.Sprintf("%d:%s", a, b)
 		}),
-		hsm.OperationDef("ctxOnly", func(ctx context.Context) string {
+		hsm.Operation("ctxOnly", func(ctx context.Context) string {
 			return ctx.Value(ctxKey("k")).(string)
 		}),
-		hsm.OperationDef("instanceOnly", func(sm *CallSigHSM) string {
+		hsm.Operation("instanceOnly", func(sm *CallSigHSM) string {
 			sm.record("instanceOnly")
 			return "instance"
 		}),
-		hsm.OperationDef("methodExpr", (*CallSigHSM).methodExpr),
-		hsm.OperationDef("variadic", func(prefix string, nums ...int) int {
+		hsm.Operation("methodExpr", (*CallSigHSM).methodExpr),
+		hsm.Operation("variadic", func(prefix string, nums ...int) int {
 			if prefix != "sum" {
 				return -1
 			}
@@ -1056,7 +1075,7 @@ func TestCallSignatureMatchingAndErrors(t *testing.T) {
 			}
 			return total
 		}),
-		hsm.OperationDef("errorOnly", func() error {
+		hsm.Operation("errorOnly", func() error {
 			return opErr
 		}),
 		hsm.State("idle"),
@@ -1127,24 +1146,29 @@ func TestCallValidation(t *testing.T) {
 	assertPanic(t, "operation name empty", func() {
 		hsm.Define(
 			"BadOpEmpty",
-			hsm.OperationDef("", func() {}),
+			hsm.Operation("", func() {}),
 			hsm.State("s"),
 			hsm.Initial(hsm.Target("s")),
 		)
 	})
-	assertPanic(t, "operation name with slash", func() {
-		hsm.Define(
-			"BadOpSlash",
-			hsm.OperationDef("bad/name", func() {}),
+	assertNoPanic(t, "operation name with slash", func() {
+		model := hsm.Define(
+			"OpSlash",
+			hsm.Operation("bad/name", func() string { return "ok" }),
 			hsm.State("s"),
 			hsm.Initial(hsm.Target("s")),
 		)
+		sm := hsm.Started(context.Background(), &AttrHSM{}, &model)
+		result, err := sm.Call(context.Background(), "bad/name")
+		if err != nil || result != "ok" {
+			t.Fatal("expected slashed operation call to succeed", "result", result, "err", err)
+		}
 	})
 	assertPanic(t, "operation duplicate", func() {
 		hsm.Define(
 			"BadOpDup",
-			hsm.OperationDef("dup", func() {}),
-			hsm.OperationDef("dup", func() {}),
+			hsm.Operation("dup", func() {}),
+			hsm.Operation("dup", func() {}),
 			hsm.State("s"),
 			hsm.Initial(hsm.Target("s")),
 		)
@@ -1152,7 +1176,7 @@ func TestCallValidation(t *testing.T) {
 	assertPanic(t, "operation not function", func() {
 		hsm.Define(
 			"BadOpType",
-			hsm.OperationDef("bad", 123),
+			hsm.Operation("bad", 123),
 			hsm.State("s"),
 			hsm.Initial(hsm.Target("s")),
 		)
@@ -1162,27 +1186,41 @@ func TestCallValidation(t *testing.T) {
 			"BadOnCallOwner",
 			hsm.State("s", hsm.OnCall("do")),
 			hsm.State("t"),
-			hsm.OperationDef("do", func() {}),
+			hsm.Operation("do", func() {}),
 			hsm.Initial(hsm.Target("s")),
 		)
 	})
 	assertPanic(t, "OnCall empty name", func() {
 		hsm.Define(
 			"BadOnCallEmpty",
-			hsm.OperationDef("do", func() {}),
+			hsm.Operation("do", func() {}),
 			hsm.State("s", hsm.Transition(hsm.OnCall(""), hsm.Target("../t"))),
 			hsm.State("t"),
 			hsm.Initial(hsm.Target("s")),
 		)
 	})
-	assertPanic(t, "OnCall name with slash", func() {
-		hsm.Define(
-			"BadOnCallSlash",
-			hsm.OperationDef("do", func() {}),
+	assertNoPanic(t, "OnCall name with slash", func() {
+		model := hsm.Define(
+			"OnCallSlash",
+			hsm.Operation("bad/name", func() {}),
 			hsm.State("s", hsm.Transition(hsm.OnCall("bad/name"), hsm.Target("../t"))),
 			hsm.State("t"),
 			hsm.Initial(hsm.Target("s")),
 		)
+		sm := hsm.Started(context.Background(), &AttrHSM{}, &model)
+		_, err := sm.Call(context.Background(), "bad/name")
+		if err != nil {
+			t.Fatal("expected slashed OnCall to succeed", "err", err)
+		}
+		deadline := time.After(time.Second)
+		for sm.State() != "/OnCallSlash/t" {
+			select {
+			case <-deadline:
+				t.Fatal("state did not transition on slashed OnCall", "state", sm.State())
+			default:
+				time.Sleep(time.Millisecond)
+			}
+		}
 	})
 	assertPanic(t, "OnCall missing operation", func() {
 		hsm.Define(
