@@ -1799,17 +1799,6 @@ type mutex struct {
 	signal   atomic.Value
 }
 
-type processKey struct{}
-
-func inProcess(ctx context.Context) bool {
-	if ctx == nil {
-		return false
-	}
-	value := ctx.Value(processKey{})
-	ok, _ := value.(bool)
-	return ok
-}
-
 func (mutex *mutex) wLock() {
 	mutex.internal.Lock()
 	mutex.signal.Store(make(chan struct{}))
@@ -2086,7 +2075,7 @@ func (sm *hsm[T]) setAttribute(ctx context.Context, name string, value any, emit
 		return closedChannel
 	}
 	if ctx == nil {
-		ctx = context.Background()
+		ctx = sm.context
 	}
 	old, exists := sm.attributes.Load(name)
 	sm.attributes.Store(name, value)
@@ -2114,7 +2103,7 @@ func (sm *hsm[T]) Call(ctx context.Context, name string, args ...any) (any, erro
 		return nil, ErrNilHSM
 	}
 	if ctx == nil {
-		ctx = context.Background()
+		ctx = sm.context
 	}
 	if name == "" {
 		return nil, ErrInvalidOperation
@@ -2132,20 +2121,7 @@ func (sm *hsm[T]) Call(ctx context.Context, name string, args ...any) (any, erro
 			Args: args,
 		},
 	}
-	if inProcess(ctx) {
-		if event.ID == "" {
-			event.ID = muid.MakeString()
-		}
-		transitionTaken, deferred := sm.processEvent(ctx, &event)
-		if deferred {
-			sm.queue.push(event)
-		}
-		if transitionTaken {
-			// No-op: state already updated by processEvent.
-		}
-	} else {
-		<-sm.dispatch(ctx, event)
-	}
+	sm.dispatch(ctx, event)
 	return sm.invokeOperation(op, ctx, args...)
 }
 
@@ -2605,7 +2581,6 @@ func (sm *hsm[T]) terminate(ctx context.Context, element Element) {
 }
 
 func (sm *hsm[T]) process(ctx context.Context) {
-	ctx = context.WithValue(ctx, processKey{}, true)
 	defer func() {
 		if r := recover(); r != nil {
 			err := fmt.Errorf("hsm: panic while processing event in state machine: %v\n\n%s", r, string(debug.Stack()))
