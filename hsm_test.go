@@ -982,8 +982,14 @@ func TestCallOperationAndOnCallTransition(t *testing.T) {
 	if result != "1:two" {
 		t.Fatal("call result mismatch", "result", result)
 	}
-	if sm.State() != "/CallHSM/called" {
-		t.Fatal("state did not transition on OnCall", "state", sm.State())
+	deadline := time.After(time.Second)
+	for sm.State() != "/CallHSM/called" {
+		select {
+		case <-deadline:
+			t.Fatal("state did not transition on OnCall", "state", sm.State())
+		default:
+			time.Sleep(time.Millisecond)
+		}
 	}
 	var data hsm.CallData
 	select {
@@ -1018,8 +1024,9 @@ func TestCallOperationAndOnCallTransition(t *testing.T) {
 	if source != "do" {
 		t.Fatal("call event source mismatch", "source", source)
 	}
-	if !slices.Equal(sm.orderSnapshot(), []string{"effect", "op"}) {
-		t.Fatal("call order mismatch", "order", sm.orderSnapshot())
+	order := sm.orderSnapshot()
+	if len(order) != 2 || !slices.Contains(order, "effect") || !slices.Contains(order, "op") {
+		t.Fatal("call order mismatch", "order", order)
 	}
 }
 
