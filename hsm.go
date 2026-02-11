@@ -855,6 +855,9 @@ func Transition[T interface{ RedefinableElement | string }](nameOrPartialElement
 			source: ".",
 			paths:  map[string]paths{},
 		}
+		if _, ok := model.members[transition.QualifiedName()]; ok {
+			traceback(fmt.Errorf("\"%s\" already defined", transition.QualifiedName()))
+		}
 		model.members[transition.QualifiedName()] = transition
 		stack = append(stack, transition)
 		apply(model, stack, partialElements...)
