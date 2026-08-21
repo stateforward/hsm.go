@@ -64,8 +64,8 @@ func TestRuntimeDispatchIgnoresInactiveDirectInstance(t *testing.T) {
 		t.Fatal("unstarted direct dispatch executed transition effect")
 	case <-time.After(waiterShouldRemainPendingFor):
 	}
-	if got := sm.State(); got != "/RuntimeInactiveDispatchHSM" {
-		t.Fatalf("unstarted state = %q, want root state", got)
+	if got := sm.State(); got != "" {
+		t.Fatalf("unstarted state = %q, want empty state", got)
 	}
 
 	hsm.Start(context.Background(), sm)
@@ -280,7 +280,7 @@ func TestRuntimeLifecycleGuardsNativeAPIs(t *testing.T) {
 		t.Fatalf("call before start invoked operation %d time(s)", calls)
 	}
 	assertCompletionErr(t, "restart before start", hsm.Restart(context.Background(), sm), hsm.ErrInvalidState)
-	if sm.State() != "/RuntimeLifecycleNativeGuardsHSM" {
+	if sm.State() != "" {
 		t.Fatalf("restart before start changed state to %s", sm.State())
 	}
 	beforeSnapshot := hsm.TakeSnapshot(context.Background(), sm)

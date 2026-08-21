@@ -447,7 +447,7 @@ func TestComplex(t *testing.T) {
 	}
 	trace.reset()
 	<-hsm.Stop(ctx, sm)
-	if sm.State() != "/TestHSM" {
+	if sm.State() != "" {
 		t.Fatal("state is not correct", "state", sm.State())
 	}
 

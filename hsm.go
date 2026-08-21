@@ -2031,11 +2031,28 @@ func (sm *hsm[T]) Clock() Clock {
 	return sm.clock
 }
 
-func (sm *hsm[T]) State() string {
-	if sm == nil {
-		return ""
+// activeState returns the currently active state element, or nil when the
+// machine has no observable active state because it was never started or is
+// stopped. Liveness follows the shared instance registry: start registers the
+// machine and stop deregisters it, while an expired context deadline alone
+// does not mean the machine stopped.
+func (sm *hsm[T]) activeState() *state {
+	if sm == nil || sm.context == nil {
+		return nil
 	}
-	state := sm.state.Load().(Element)
+	instances, ok := sm.context.Value(Keys.Instances).(*sync.Map)
+	if !ok {
+		return nil
+	}
+	if _, live := instances.Load(sm.behavior.id); !live {
+		return nil
+	}
+	active, _ := sm.state.Load().(*state)
+	return active
+}
+
+func (sm *hsm[T]) State() string {
+	state := sm.activeState()
 	if state == nil {
 		return ""
 	}

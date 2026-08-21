@@ -181,7 +181,7 @@ func TestGroupStatesAndSnapshotsPreserveOrderThroughLifecycle(t *testing.T) {
 	assertStates("after restart dispatch all", group.States(), done, done)
 
 	awaitWaiter(t, "group stop", hsm.Stop(context.Background(), group))
-	assertStates("after stop", group.States(), root, root)
+	assertStates("after stop", group.States(), "", "")
 	assertSnapshotOrder("after stop", hsm.TakeSnapshot(context.Background(), group), []string{"first", "second"}, []string{root, root})
 }
 
