@@ -210,6 +210,7 @@ type runner struct {
 	pendingTimerKindsByG  map[uint64][]string
 	pendingTimerNamesByG  map[uint64][]string
 	stableLabel           string
+	lastDispatchQueued    bool
 	lastError             *conformanceError
 	callErrorBaselines    []*conformanceError
 	cancelledActivities   map[string]bool
@@ -5247,6 +5248,7 @@ func (r *runner) executeStep(step op) (err error) {
 			r.recordLifecycleError("operation requires a started HSM")
 			break
 		}
+		r.lastDispatchQueued = true
 		statePath := instance.State()
 		eventWillDefer := r.eventWouldDeferAtState(statePath, event.Name)
 		traceDeferAfterDispatch := eventWillDefer && r.statePathHasGuardedEventTransition(statePath, event.Name)
@@ -5294,6 +5296,7 @@ func (r *runner) executeStep(step op) (err error) {
 		if err := r.waitFor(r.ctx, r.dispatchAll(r.ctx, event, true, nil), "dispatch_all"); err != nil {
 			return err
 		}
+		r.lastDispatchQueued = activeTargets > 0
 		for _, id := range r.instanceOrder {
 			if statePath, ok := deferredTargets[id]; ok {
 				r.traceDeferredDispatchAtState(r.instances[id], event.Name, statePath)
@@ -5341,6 +5344,7 @@ func (r *runner) executeStep(step op) (err error) {
 		if err := r.waitFor(r.ctx, r.dispatchTo(r.ctx, event, targets, true, nil), "dispatch_to"); err != nil {
 			return err
 		}
+		r.lastDispatchQueued = activeTargets > 0
 		if len(targets) == 1 && containsString(r.caseData.Features, "redefine") {
 			r.stableLabel = r.stateFor(targets[0])
 		}
@@ -5400,6 +5404,7 @@ func (r *runner) executeStep(step op) (err error) {
 		if err := r.waitFor(r.ctx, dispatched, "group_dispatch"); err != nil {
 			return err
 		}
+		r.lastDispatchQueued = activeTargets > 0
 		for _, memberID := range r.groupMembers[groupID] {
 			if statePath, ok := deferredTargets[memberID]; ok {
 				r.traceDeferredDispatchAtState(r.instances[memberID], event.Name, statePath)
@@ -6318,6 +6323,9 @@ func (r *runner) assertExpectations() error {
 }
 
 func (r *runner) assertExpectationObject(expect anyMap) error {
+	if queued, ok := expect["queued"].(bool); ok && r.lastDispatchQueued != queued {
+		return fmt.Errorf("dispatch queued mismatch: got %t want %t", r.lastDispatchQueued, queued)
+	}
 	if expectedError := object(expect["error"]); expectedError != nil {
 		if r.lastError == nil {
 			return fmt.Errorf("expected error but none was recorded")
